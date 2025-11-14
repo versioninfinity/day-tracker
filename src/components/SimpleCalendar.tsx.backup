@@ -3,11 +3,6 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { stat, readTextFile, writeTextFile, exists, BaseDirectory } from '@tauri-apps/plugin-fs';
 import { openPath } from '@tauri-apps/plugin-opener';
 
-// Cloud sync configuration
-// TODO: Replace with your Vercel API URL after deployment
-const CLOUD_API_URL = 'https://your-api-url.vercel.app/api/sessions';
-const ENABLE_CLOUD_SYNC = false; // Set to true after deploying API and updating URL above
-
 interface TimeSlot {
   date: string; // ISO date string (YYYY-MM-DD)
   day: number; // 0-6 for Sun-Sat
@@ -112,56 +107,10 @@ export default function SimpleCalendar() {
       };
       localStorage.setItem('day-tracker-sessions', JSON.stringify(data));
       console.log('Saved to localStorage:', data);
-
-      // Also sync to cloud if enabled
-      if (ENABLE_CLOUD_SYNC) {
-        syncToCloud(data);
-      }
     } catch (error) {
       console.error('Error saving sessions:', error);
     }
   }, [slots, allLabels, labelColors, isInitialLoad]);
-
-  // Cloud sync functions
-  const syncToCloud = async (data: { slots: TimeSlot[], allLabels: string[], labelColors: LabelColor[] }) => {
-    try {
-      const response = await fetch(CLOUD_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(data),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Cloud sync failed: ${response.statusText}`);
-      }
-
-      console.log('✅ Synced to cloud successfully');
-    } catch (error) {
-      console.error('❌ Cloud sync error:', error);
-      // Don't throw - we don't want to break the app if cloud sync fails
-    }
-  };
-
-  const loadFromCloud = async () => {
-    if (!ENABLE_CLOUD_SYNC) return null;
-
-    try {
-      const response = await fetch(CLOUD_API_URL);
-
-      if (!response.ok) {
-        throw new Error(`Cloud load failed: ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      console.log('✅ Loaded from cloud successfully');
-      return data;
-    } catch (error) {
-      console.error('❌ Cloud load error:', error);
-      return null;
-    }
-  };
 
   // Helper to get local date string (YYYY-MM-DD) without timezone conversion
   const getLocalDateString = (date: Date): string => {
@@ -358,9 +307,10 @@ export default function SimpleCalendar() {
 
       // Remove old slots for this session (if editing)
       const filteredSlots = slots.filter(s => {
-        if (s.date === dateString && s.day === editingSession.day && s.column === editingSession.column) {
-          // Check if this slot is part of the session being edited (same column, same title)
-          return s.title !== sessionTitle.trim();
+        if (s.date === dateString && s.day === editingSession.day) {
+          // Check if this slot is part of the session being edited
+          const existingSlot = getSlotAtPosition(editingSession.day, s.hour);
+          return !existingSlot || existingSlot.title !== sessionTitle.trim();
         }
         return true;
       });
@@ -407,9 +357,9 @@ export default function SimpleCalendar() {
       const sessionDate = weekDates[editingSession.day];
       const dateString = getLocalDateString(sessionDate);
 
-      // Remove all slots for this session (in the same column)
+      // Remove all slots for this session
       const filteredSlots = slots.filter(s => {
-        if (s.date === dateString && s.day === editingSession.day && s.column === editingSession.column && s.title === sessionTitle.trim()) {
+        if (s.date === dateString && s.day === editingSession.day && s.title === sessionTitle.trim()) {
           return false;
         }
         return true;
@@ -743,15 +693,14 @@ export default function SimpleCalendar() {
                       minWidth: '120px',
                       height: '60px',
                       borderRight: '1px solid #F3F4F6',
-                      borderBottom: '2px solid #F3F4F6',
+                      borderBottom: '2px solid #D1D5DB',
                       boxSizing: 'border-box',
                       display: 'grid',
                       gridTemplateColumns: 'repeat(2, 1fr)',
                       gridTemplateRows: 'repeat(4, 1fr)',
                       gap: '1px',
-                      backgroundColor: '#F3F4F6',
-                      padding: '1px',
-                      gridAutoFlow: 'column'
+                      backgroundColor: '#D1D5DB',
+                      padding: '1px'
                     }}
                   >
                     {/* 8 grid cells: 2 columns x 4 rows */}
@@ -865,8 +814,8 @@ export default function SimpleCalendar() {
                                 position: 'absolute',
                                 left: `${sessionLeft}%`,
                                 width: `${sessionWidth}%`,
-                                top: `${partialColorTop}%`,
-                                height: `${partialColorHeight}%`,
+                                top: 0,
+                                bottom: 0,
                                 display: 'flex',
                                 alignItems: 'center',
                                 justifyContent: 'center',

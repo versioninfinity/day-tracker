@@ -31,7 +31,20 @@ export default function Calendar({ weekData, onSessionCreate, onSessionUpdate, o
   const hours = Array.from({ length: 24 }, (_, i) => i);
   const today = new Date();
 
-  const handleMouseDown = (date: Date, hour: number) => {
+  // Click handler for session blocks
+  const handleSessionClick = (session: Session, e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    console.log('Session clicked:', session.title);
+    setEditingSession(session);
+    setIsModalOpen(true);
+  };
+
+  // Click handler for empty blocks - start drag to create
+  const handleEmptyBlockMouseDown = (date: Date, hour: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    console.log('Empty block mouse down:', date, hour);
     setDragState({
       isDragging: true,
       startDate: date,
@@ -40,8 +53,10 @@ export default function Calendar({ weekData, onSessionCreate, onSessionUpdate, o
     });
   };
 
-  const handleMouseEnter = (date: Date, hour: number) => {
+  const handleEmptyBlockMouseEnter = (date: Date, hour: number, e: React.MouseEvent) => {
+    e.stopPropagation();
     if (dragState.isDragging && dragState.startDate?.toDateString() === date.toDateString()) {
+      console.log('Empty block mouse enter:', date, hour);
       const newEndHour = hour + 1;
       setDragState((prev) => ({
         ...prev,
@@ -50,7 +65,10 @@ export default function Calendar({ weekData, onSessionCreate, onSessionUpdate, o
     }
   };
 
-  const handleMouseUp = (date: Date, hour: number) => {
+  const handleEmptyBlockMouseUp = (date: Date, hour: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    console.log('Empty block mouse up:', date, hour);
     if (dragState.isDragging && dragState.startHour !== null && dragState.startDate) {
       const startHour = Math.min(dragState.startHour, hour);
       const endHour = Math.max(dragState.startHour + 1, hour + 1);
@@ -69,11 +87,6 @@ export default function Calendar({ weekData, onSessionCreate, onSessionUpdate, o
         endHour: null,
       });
     }
-  };
-
-  const handleSessionClick = (session: Session) => {
-    setEditingSession(session);
-    setIsModalOpen(true);
   };
 
   const handleModalClose = () => {
@@ -167,48 +180,99 @@ export default function Calendar({ weekData, onSessionCreate, onSessionUpdate, o
             </div>
 
             {/* Day columns */}
-            {weekData.map((day, dayIndex) => (
-              <div
-                key={day.date.toISOString()}
-                className={`flex-1 bg-white ${dayIndex < weekData.length - 1 ? 'border-r border-gray-200' : ''}`}
-              >
-                {/* Day header - empty for now, day name is in top header */}
-                <div className="h-12 border-b border-gray-200"></div>
+            {weekData.map((day, dayIndex) => {
+              // Helper to find which session (if any) occupies a specific block
+              const getSessionAtBlock = (hour: number, halfHour: 0 | 1, column: 0 | 1 | 2 | 3) => {
+                const blockStartMinutes = hour * 60 + halfHour * 30;
+                const blockEndMinutes = blockStartMinutes + 30;
 
-                {/* Hour slots */}
-                {hours.map((hour) => {
-                  const sessionsAtHour = day.sessions.filter((session) => {
-                    const sessionHour = session.startTime.getHours();
-                    return sessionHour === hour;
-                  });
+                // Find the first session that matches this exact block
+                return day.sessions.find(session => {
+                  const sessionStartMinutes = session.startTime.getHours() * 60 + session.startTime.getMinutes();
+                  const sessionEndMinutes = session.endTime.getHours() * 60 + session.endTime.getMinutes();
 
-                  const isInDragPreview = isDragPreviewInSlot(day.date, hour);
+                  // Session must overlap this block
+                  const overlaps = sessionStartMinutes < blockEndMinutes && sessionEndMinutes > blockStartMinutes;
 
-                  return (
-                    <div
-                      key={hour}
-                      className={`h-16 border-b border-gray-200 cursor-pointer transition-colors relative select-none ${
-                        isInDragPreview ? 'bg-blue-200' : 'hover:bg-blue-50'
-                      }`}
-                      onMouseDown={() => handleMouseDown(day.date, hour)}
-                      onMouseEnter={() => handleMouseEnter(day.date, hour)}
-                      onMouseUp={() => handleMouseUp(day.date, hour)}
-                    >
-                      {sessionsAtHour.map((session) => (
-                        <SessionBlock
-                          key={session.id}
-                          session={session}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleSessionClick(session);
-                          }}
-                        />
-                      ))}
-                    </div>
-                  );
-                })}
-              </div>
-            ))}
+                  // For now, all sessions go in column 0 (leftmost)
+                  return overlaps && column === 0;
+                }) || null;
+              };
+
+              return (
+                <div
+                  key={day.date.toISOString()}
+                  className={`flex-1 bg-white ${dayIndex < weekData.length - 1 ? 'border-r border-gray-200' : ''} relative`}
+                >
+                  {/* Day header */}
+                  <div className="h-12 border-b border-gray-200"></div>
+
+                  {/* Hour slots - each hour is 8 divs (2 rows x 4 columns) */}
+                  {hours.map((hour) => {
+                    const isInDragPreview = isDragPreviewInSlot(day.date, hour);
+
+                    return (
+                      <div
+                        key={hour}
+                        className="h-16 border-b-2 border-gray-400 relative"
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(4, 1fr)',
+                          gridTemplateRows: 'repeat(2, 1fr)',
+                          gap: '2px',
+                          backgroundColor: '#9CA3AF',
+                          padding: '1px',
+                          gridAutoFlow: 'column'
+                        }}
+                      >
+                        {/* 8 divs: 4 columns x 2 half-hours */}
+                        {([0, 1, 2, 3] as const).map((column) =>
+                          ([0, 1] as const).map((halfHour) => {
+                            const session = getSessionAtBlock(hour, halfHour, column);
+                            const blockKey = `${hour}-${halfHour}-${column}`;
+
+                            if (session) {
+                              // This block belongs to a session
+                              return (
+                                <div
+                                  key={blockKey}
+                                  className="bg-blue-100 cursor-pointer hover:shadow-md transition-shadow flex items-center justify-center text-xs overflow-hidden"
+                                  onClick={(e) => handleSessionClick(session, e)}
+                                  onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                                  onMouseEnter={(e) => { e.stopPropagation(); }}
+                                  onMouseUp={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                                  title={session.title}
+                                >
+                                  {/* Only show title in first block of session */}
+                                  {halfHour === 0 && (
+                                    <span className="truncate px-1 font-semibold text-gray-900 text-[10px]">
+                                      {session.title}
+                                    </span>
+                                  )}
+                                </div>
+                              );
+                            } else {
+                              // Empty block with visible grid
+                              return (
+                                <div
+                                  key={blockKey}
+                                  className={`bg-white cursor-pointer transition-colors select-none ${
+                                    isInDragPreview ? 'bg-blue-200' : 'hover:bg-blue-50'
+                                  }`}
+                                  onMouseDown={(e) => handleEmptyBlockMouseDown(day.date, hour, e)}
+                                  onMouseEnter={(e) => handleEmptyBlockMouseEnter(day.date, hour, e)}
+                                  onMouseUp={(e) => handleEmptyBlockMouseUp(day.date, hour, e)}
+                                />
+                              );
+                            }
+                          })
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>
