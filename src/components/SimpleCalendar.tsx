@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { stat } from '@tauri-apps/plugin-fs';
 import { openPath } from '@tauri-apps/plugin-opener';
+import { storageService } from '../services/storage';
 
 // Cloud sync configuration
 // TODO: Replace with your Vercel API URL after deployment
@@ -21,6 +22,7 @@ interface TimeSlot {
   startHour?: number; // Actual start hour for the session
   endHour?: number; // Actual end hour for the session
   column?: number; // Which column (0 or 1) this session belongs to
+  sessionId?: string; // Unique ID for tracking files in database
 }
 
 interface SessionEdit {
@@ -30,6 +32,7 @@ interface SessionEdit {
   endHour: number;
   endMinute: number;
   column: number; // Which column (0 or 1) this session belongs to
+  sessionId: string; // Unique ID for this session
 }
 
 interface FileLink {
@@ -38,11 +41,33 @@ interface FileLink {
   path: string;
   size: number;
   type: 'file' | 'folder';
+  hash?: string; // File content hash (from storage service)
+  metadataId?: string; // ID in the file_metadata database table
+  tracked?: boolean; // Whether this file has been tracked in the database
 }
 
 interface LabelColor {
   name: string;
   color: string;
+}
+
+// Animated dots component for loading indicator
+function AnimatedDots() {
+  const [dots, setDots] = useState('.');
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setDots(prev => {
+        if (prev === '.') return '..';
+        if (prev === '..') return '...';
+        return '.';
+      });
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  return <span>{dots}</span>;
 }
 
 export default function SimpleCalendar() {
@@ -65,6 +90,12 @@ export default function SimpleCalendar() {
   const [sessionNotes, setSessionNotes] = useState('');
   const [weekOffset, setWeekOffset] = useState(0); // 0 = current week, -1 = previous week, +1 = next week
   const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [fileTrackingProgress, setFileTrackingProgress] = useState<{
+    isTracking: boolean;
+    current: number;
+    total: number;
+    fileName: string;
+  } | null>(null);
 
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const hours = Array.from({ length: 24 }, (_, i) => i);
@@ -329,6 +360,7 @@ export default function SimpleCalendar() {
             endHour: newEndHour,
             endMinute: newEndMinute,
             column: dragEnd.col,
+            sessionId: session.sessionId, // Preserve session ID when moving
           });
         }
 
@@ -343,6 +375,7 @@ export default function SimpleCalendar() {
           endHour: session.endHour ?? 1,
           endMinute: session.endMinute ?? 0,
           column: session.column ?? 0,
+          sessionId: session.sessionId ?? crypto.randomUUID(), // Use existing or create new
         });
         setSessionTitle(session.title || '');
         setSessionLabels(session.labels || []);
@@ -380,6 +413,7 @@ export default function SimpleCalendar() {
         endHour,
         endMinute,
         column: dragStart.col,
+        sessionId: crypto.randomUUID(), // Generate new session ID
       });
       setSessionTitle('');
       setSessionLabels([]);
@@ -442,6 +476,7 @@ export default function SimpleCalendar() {
           endHour: editingSession.endHour,
           endMinute: editingSession.endMinute,
           column: editingSession.column,
+          sessionId: editingSession.sessionId, // Include session ID
         });
       }
       setSlots([...filteredSlots, ...newSlots]);
@@ -522,6 +557,8 @@ export default function SimpleCalendar() {
   };
 
   const handleAddFiles = async () => {
+    if (!editingSession) return;
+
     try {
       const selected = await open({
         multiple: true,
@@ -535,12 +572,36 @@ export default function SimpleCalendar() {
         for (const path of paths) {
           try {
             const metadata = await stat(path);
+
+            // Track file in database
+            let fileHash: string | undefined;
+            let metadataId: string | undefined;
+            let tracked = false;
+
+            // Only track if storage service is initialized
+            if (storageService.isInitialized()) {
+              try {
+                const fileMetadata = await storageService.trackFile(editingSession.sessionId, path);
+                fileHash = fileMetadata.file_hash || undefined;
+                metadataId = fileMetadata.id;
+                tracked = true;
+                console.log(`✅ Tracked file: ${fileMetadata.file_name} (${fileMetadata.file_hash?.substring(0, 12)}...)`);
+              } catch (trackError) {
+                console.warn('⚠️  Could not track file in database:', trackError);
+              }
+            } else {
+              console.warn('⚠️  Storage service not initialized - file will be linked but not tracked');
+            }
+
             newFiles.push({
               id: crypto.randomUUID(),
               name: path.split('/').pop() || path,
               path,
               size: metadata.size,
               type: 'file',
+              hash: fileHash,
+              metadataId,
+              tracked,
             });
           } catch (error) {
             console.error('Error reading file metadata:', error);
@@ -555,6 +616,8 @@ export default function SimpleCalendar() {
   };
 
   const handleAddFolder = async () => {
+    if (!editingSession) return;
+
     try {
       const selected = await open({
         multiple: false,
@@ -562,6 +625,51 @@ export default function SimpleCalendar() {
       });
 
       if (selected && typeof selected === 'string') {
+        // Track folder in database
+        let fileHash: string | undefined;
+        let metadataId: string | undefined;
+        let tracked = false;
+
+        // Only track if storage service is initialized
+        if (storageService.isInitialized()) {
+          try {
+            // Set initial loading state
+            setFileTrackingProgress({
+              isTracking: true,
+              current: 0,
+              total: 0,
+              fileName: 'Scanning...',
+            });
+
+            // Track file with progress callback
+            const fileMetadata = await storageService.trackFile(
+              editingSession.sessionId,
+              selected,
+              (current, total, fileName) => {
+                setFileTrackingProgress({
+                  isTracking: true,
+                  current,
+                  total,
+                  fileName,
+                });
+              }
+            );
+
+            fileHash = fileMetadata.file_hash || undefined;
+            metadataId = fileMetadata.id;
+            tracked = true;
+            console.log(`✅ Tracked folder: ${fileMetadata.file_name} (${fileMetadata.file_hash?.substring(0, 12)}...)`);
+
+            // Clear loading state
+            setFileTrackingProgress(null);
+          } catch (trackError) {
+            console.warn('⚠️  Could not track folder in database:', trackError);
+            setFileTrackingProgress(null);
+          }
+        } else {
+          console.warn('⚠️  Storage service not initialized - folder will be linked but not tracked');
+        }
+
         setSessionFiles([
           ...sessionFiles,
           {
@@ -570,11 +678,15 @@ export default function SimpleCalendar() {
             path: selected,
             size: 0,
             type: 'folder',
+            hash: fileHash,
+            metadataId,
+            tracked,
           },
         ]);
       }
     } catch (error) {
       console.error('Error selecting folder:', error);
+      setFileTrackingProgress(null);
     }
   };
 
@@ -1077,10 +1189,33 @@ export default function SimpleCalendar() {
                 <button
                   onClick={handleAddFolder}
                   className="flex-1 px-3 py-2 text-sm bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors"
+                  disabled={fileTrackingProgress?.isTracking}
                 >
                   Add Folder
                 </button>
               </div>
+
+              {/* Loading indicator */}
+              {fileTrackingProgress?.isTracking && (
+                <div className="mb-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
+                  <div className="flex items-center gap-2 text-sm text-blue-700">
+                    <div className="animate-spin h-4 w-4 border-2 border-blue-600 border-t-transparent rounded-full"></div>
+                    <div>
+                      <div className="font-medium">
+                        Loading<AnimatedDots />
+                      </div>
+                      {fileTrackingProgress.total > 0 && (
+                        <div className="text-xs text-blue-600">
+                          {fileTrackingProgress.current} / {fileTrackingProgress.total} files
+                        </div>
+                      )}
+                      <div className="text-xs text-blue-500 truncate max-w-md" title={fileTrackingProgress.fileName}>
+                        {fileTrackingProgress.fileName}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {sessionFiles.length > 0 && (
                 <div className="mt-3 space-y-2">
@@ -1093,9 +1228,21 @@ export default function SimpleCalendar() {
                         className="flex-1 min-w-0 cursor-pointer"
                         onClick={() => handleOpenFile(file.path)}
                       >
-                        <div className="font-medium truncate text-gray-800 hover:text-blue-600">{file.name}</div>
+                        <div className="flex items-center gap-2">
+                          <div className="font-medium truncate text-gray-800 hover:text-blue-600">{file.name}</div>
+                          {file.tracked && (
+                            <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-700 rounded" title="Tracked in database">
+                              ✓ Tracked
+                            </span>
+                          )}
+                        </div>
                         <div className="text-gray-500 truncate text-[10px]">{file.path}</div>
                         <div className="text-gray-400">{formatFileSize(file.size)}</div>
+                        {file.hash && (
+                          <div className="text-gray-400 text-[10px] font-mono" title={`Hash: ${file.hash}`}>
+                            Hash: {file.hash.substring(0, 16)}...
+                          </div>
+                        )}
                       </div>
                       <div className="flex items-center gap-2 ml-2">
                         <button
