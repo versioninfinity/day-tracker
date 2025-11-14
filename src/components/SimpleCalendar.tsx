@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { stat, readTextFile, writeTextFile, exists, BaseDirectory } from '@tauri-apps/plugin-fs';
+import { stat } from '@tauri-apps/plugin-fs';
 import { openPath } from '@tauri-apps/plugin-opener';
 
 // Cloud sync configuration
@@ -49,6 +49,7 @@ export default function SimpleCalendar() {
   const [slots, setSlots] = useState<TimeSlot[]>([]);
   const [dragStart, setDragStart] = useState<{ day: number; hour: number; minute: number; col: number } | null>(null);
   const [dragEnd, setDragEnd] = useState<{ day: number; hour: number; minute: number; col: number } | null>(null);
+  const [movingSession, setMovingSession] = useState<{ session: TimeSlot; offsetMinutes: number } | null>(null);
   const [editingSession, setEditingSession] = useState<SessionEdit | null>(null);
   const [sessionTitle, setSessionTitle] = useState('');
   const [sessionLabels, setSessionLabels] = useState<string[]>([]);
@@ -64,7 +65,6 @@ export default function SimpleCalendar() {
   const [sessionNotes, setSessionNotes] = useState('');
   const [weekOffset, setWeekOffset] = useState(0); // 0 = current week, -1 = previous week, +1 = next week
   const [isInitialLoad, setIsInitialLoad] = useState(true);
-  const [editingLabelColor, setEditingLabelColor] = useState<string | null>(null);
 
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const hours = Array.from({ length: 24 }, (_, i) => i);
@@ -144,25 +144,6 @@ export default function SimpleCalendar() {
     }
   };
 
-  const loadFromCloud = async () => {
-    if (!ENABLE_CLOUD_SYNC) return null;
-
-    try {
-      const response = await fetch(CLOUD_API_URL);
-
-      if (!response.ok) {
-        throw new Error(`Cloud load failed: ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      console.log('✅ Loaded from cloud successfully');
-      return data;
-    } catch (error) {
-      console.error('❌ Cloud load error:', error);
-      return null;
-    }
-  };
-
   // Helper to get local date string (YYYY-MM-DD) without timezone conversion
   const getLocalDateString = (date: Date): string => {
     const year = date.getFullYear();
@@ -209,15 +190,6 @@ export default function SimpleCalendar() {
   const now = new Date();
   const currentHour = now.getHours();
   const currentMinute = now.getMinutes();
-  const currentTimePosition = currentHour * 60 + currentMinute; // Minutes from midnight
-
-  const getMinuteFromMouseEvent = (e: React.MouseEvent<HTMLDivElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const y = e.clientY - rect.top;
-    const cellHeight = 60; // Height of each hour cell in pixels
-    const minute = Math.floor((y / cellHeight) * 60);
-    return Math.max(0, Math.min(59, minute));
-  };
 
   const handleCellMouseDown = (day: number, hour: number, col: number, row: number, e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -257,20 +229,19 @@ export default function SimpleCalendar() {
 
     console.log('Found session:', existingSessionInCell);
 
-    // If clicking on existing session in this specific cell, open edit mode
+    // If clicking on existing session, start tracking for drag-to-move
     if (existingSessionInCell) {
-      setEditingSession({
-        day: day,
-        startHour: existingSessionInCell.startHour ?? hour,
-        startMinute: existingSessionInCell.startMinute ?? 0,
-        endHour: existingSessionInCell.endHour ?? (hour + 1),
-        endMinute: existingSessionInCell.endMinute ?? 0,
-        column: existingSessionInCell.column ?? 0,
+      // Calculate offset from session start to where we clicked
+      const sessionStartMinutes = (existingSessionInCell.startHour ?? hour) * 60 + (existingSessionInCell.startMinute ?? 0);
+      const clickMinutes = hour * 60 + minute;
+      const offsetMinutes = clickMinutes - sessionStartMinutes;
+
+      setMovingSession({
+        session: existingSessionInCell,
+        offsetMinutes
       });
-      setSessionTitle(existingSessionInCell.title || '');
-      setSessionLabels(existingSessionInCell.labels || []);
-      setSessionFiles(existingSessionInCell.files || []);
-      setSessionNotes(existingSessionInCell.notes || '');
+      setDragStart({ day, hour, minute, col });
+      setDragEnd({ day, hour, minute, col });
       return;
     }
 
@@ -283,10 +254,18 @@ export default function SimpleCalendar() {
     e.preventDefault();
     e.stopPropagation();
 
-    if (dragStart && dragStart.day === day && dragStart.col === col) {
+    if (dragStart) {
       const minute = row * 15;
       console.log('Cell mouse enter:', day, hour, minute, 'col:', col, 'row:', row);
-      setDragEnd({ day, hour, minute, col });
+
+      // If moving a session, allow moving to different days/columns
+      if (movingSession) {
+        setDragEnd({ day, hour, minute, col });
+      }
+      // If creating new session, only allow dragging in same day/column
+      else if (dragStart.day === day && dragStart.col === col) {
+        setDragEnd({ day, hour, minute, col });
+      }
     }
   };
 
@@ -297,6 +276,88 @@ export default function SimpleCalendar() {
     const minute = row * 15;
     console.log('Cell mouse up:', day, hour, minute, 'col:', col, 'row:', row);
 
+    // Handle moving an existing session
+    if (movingSession && dragStart && dragEnd) {
+      const hasMoved = dragStart.day !== dragEnd.day ||
+                      dragStart.hour !== dragEnd.hour ||
+                      dragStart.minute !== dragEnd.minute ||
+                      dragStart.col !== dragEnd.col;
+
+      if (hasMoved) {
+        // Move the session to new location
+        const session = movingSession.session;
+        const sessionDuration = ((session.endHour ?? 0) * 60 + (session.endMinute ?? 0)) -
+                               ((session.startHour ?? 0) * 60 + (session.startMinute ?? 0));
+
+        // Calculate new start time (current mouse position minus the offset)
+        const clickMinutes = dragEnd.hour * 60 + dragEnd.minute;
+        const newStartMinutes = clickMinutes - movingSession.offsetMinutes;
+        const newEndMinutes = newStartMinutes + sessionDuration;
+
+        const newStartHour = Math.floor(newStartMinutes / 60);
+        const newStartMinute = newStartMinutes % 60;
+        const newEndHour = Math.floor(newEndMinutes / 60);
+        const newEndMinute = newEndMinutes % 60;
+
+        // Get the date string for the new day
+        const newDateString = getLocalDateString(weekDates[dragEnd.day]);
+
+        // Remove old slots for this session
+        const filteredSlots = slots.filter(s => s.title !== session.title || s.date !== session.date || s.column !== session.column);
+
+        // Create new slots for the moved session
+        const newSlots: TimeSlot[] = [];
+        const startHourForSlots = newStartHour;
+        let endHourForSlots = newEndHour;
+        if (newEndMinute === 0 && newEndHour > newStartHour) {
+          endHourForSlots = newEndHour;
+        } else {
+          endHourForSlots = newEndHour + 1;
+        }
+
+        for (let h = startHourForSlots; h < endHourForSlots; h++) {
+          newSlots.push({
+            date: newDateString,
+            day: dragEnd.day,
+            hour: h,
+            title: session.title,
+            labels: session.labels,
+            files: session.files,
+            notes: session.notes,
+            startHour: newStartHour,
+            startMinute: newStartMinute,
+            endHour: newEndHour,
+            endMinute: newEndMinute,
+            column: dragEnd.col,
+          });
+        }
+
+        setSlots([...filteredSlots, ...newSlots]);
+      } else {
+        // Just clicked (no drag), open edit mode
+        const session = movingSession.session;
+        setEditingSession({
+          day: session.day,
+          startHour: session.startHour ?? 0,
+          startMinute: session.startMinute ?? 0,
+          endHour: session.endHour ?? 1,
+          endMinute: session.endMinute ?? 0,
+          column: session.column ?? 0,
+        });
+        setSessionTitle(session.title || '');
+        setSessionLabels(session.labels || []);
+        setSessionFiles(session.files || []);
+        setSessionNotes(session.notes || '');
+      }
+
+      // Clear moving state
+      setMovingSession(null);
+      setDragStart(null);
+      setDragEnd(null);
+      return;
+    }
+
+    // Handle creating new session
     if (dragStart && dragStart.col === col) {
       // Calculate start and end times (add 15 min to end to include the full cell)
       const startTotalMinutes = dragStart.hour * 60 + dragStart.minute;
@@ -332,27 +393,17 @@ export default function SimpleCalendar() {
     }
   };
 
-  const handleSessionClick = (dayIdx: number, hour: number) => {
-    const slot = getSlotAtPosition(dayIdx, hour);
-    if (!slot) return;
-
-    // Populate the edit form with stored time values if available
-    setEditingSession({
-      day: dayIdx,
-      startHour: slot.startHour ?? hour,
-      startMinute: slot.startMinute ?? 0,
-      endHour: slot.endHour ?? (hour + 1),
-      endMinute: slot.endMinute ?? 0,
-      column: slot.column ?? 0,
-    });
-    setSessionTitle(slot.title || '');
-    setSessionLabels(slot.labels || []);
-    setSessionFiles(slot.files || []);
-    setSessionNotes(slot.notes || '');
-  };
-
   const handleSaveSession = () => {
     if (editingSession && sessionTitle.trim()) {
+      // Validate that end time is after start time
+      const startMinutes = editingSession.startHour * 60 + editingSession.startMinute;
+      const endMinutes = editingSession.endHour * 60 + editingSession.endMinute;
+
+      if (endMinutes <= startMinutes) {
+        alert('End time must be after start time');
+        return;
+      }
+
       const sessionDate = weekDates[editingSession.day];
       const dateString = getLocalDateString(sessionDate); // YYYY-MM-DD
 
@@ -547,14 +598,6 @@ export default function SimpleCalendar() {
     return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
   };
 
-  const formatTime = (hour: number, minute: number) => {
-    const isPM = hour >= 12;
-    const displayHour = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
-    const displayMinute = minute.toString().padStart(2, '0');
-    const period = isPM ? 'PM' : 'AM';
-    return `${displayHour}:${displayMinute} ${period}`;
-  };
-
   const isDragging = (day: number, hour: number) => {
     if (!dragStart || !dragEnd || dragStart.day !== day) return false;
     const startMinutes = dragStart.hour * 60 + dragStart.minute;
@@ -564,42 +607,6 @@ export default function SimpleCalendar() {
     const hourStartMinutes = hour * 60;
     const hourEndMinutes = (hour + 1) * 60 - 1;
     return hourStartMinutes <= max && hourEndMinutes >= min;
-  };
-
-  const getSlotAtPosition = (day: number, hour: number) => {
-    const dateString = getLocalDateString(weekDates[day]);
-    return slots.find(s => s.date === dateString && s.hour === hour);
-  };
-
-  const getOverlappingSlotsAtTime = (day: number, hour: number, minute: number): TimeSlot[] => {
-    const dateString = getLocalDateString(weekDates[day]);
-    const currentTimeMinutes = hour * 60 + minute;
-
-    // Get all unique sessions (by title) for this day
-    const daySessions = slots.filter(s => s.date === dateString && s.day === day);
-    const uniqueSessions = new Map<string, TimeSlot>();
-
-    daySessions.forEach(slot => {
-      if (slot.title && !uniqueSessions.has(slot.title)) {
-        uniqueSessions.set(slot.title, slot);
-      }
-    });
-
-    // Find sessions that overlap with the current time
-    const overlapping: TimeSlot[] = [];
-    uniqueSessions.forEach(session => {
-      if (session.startHour !== undefined && session.startMinute !== undefined &&
-          session.endHour !== undefined && session.endMinute !== undefined) {
-        const sessionStartMinutes = session.startHour * 60 + session.startMinute;
-        const sessionEndMinutes = session.endHour * 60 + session.endMinute;
-
-        if (currentTimeMinutes >= sessionStartMinutes && currentTimeMinutes < sessionEndMinutes) {
-          overlapping.push(session);
-        }
-      }
-    });
-
-    return overlapping.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
   };
 
   // Get all sessions that overlap with any part of an hour cell
@@ -663,7 +670,7 @@ export default function SimpleCalendar() {
             {/* Day Headers */}
             <div style={{ display: 'flex', backgroundColor: 'white', borderBottom: '1px solid #F3F4F6' }}>
               <div style={{ width: '128px', flexShrink: 0 }}></div>
-              {days.map((day, i) => {
+              {days.map((_, i) => {
                 const date = weekDates[i];
                 const isToday = date.toDateString() === today.toDateString();
                 return (
@@ -682,7 +689,7 @@ export default function SimpleCalendar() {
                     }}
                   >
                     <span className="text-xs text-gray-500 font-medium">
-                      {day.slice(0, 3)}
+                      {days[i].slice(0, 3)}
                     </span>
                     {isToday ? (
                       <div className="w-7 h-7 flex items-center justify-center bg-red-500 text-white rounded-full text-sm font-semibold">
@@ -721,14 +728,12 @@ export default function SimpleCalendar() {
               </div>
 
               {/* Day cells */}
-              {days.map((day, dayIdx) => {
-                const slot = getSlotAtPosition(dayIdx, hour); // Keep for click handler compatibility
+              {days.map((_, dayIdx) => {
                 const isDrag = isDragging(dayIdx, hour);
                 const isTodayColumn = weekDates[dayIdx].toDateString() === today.toDateString();
 
                 // Get all overlapping sessions in this hour
                 const overlappingSessions = getOverlappingSlotsInHour(dayIdx, hour);
-                const totalOverlapping = overlappingSessions.length;
 
                 // Check if current time line should be in this cell
                 const shouldShowTimeLine = isTodayColumn && currentHour === hour;
@@ -799,6 +804,12 @@ export default function SimpleCalendar() {
                   >
                     {/* Render all overlapping sessions */}
                     {!isDrag && overlappingSessions.map((slot, sessionIndex) => {
+                      // Check if this session is being moved
+                      const isBeingMoved = movingSession &&
+                        slot.title === movingSession.session.title &&
+                        slot.date === movingSession.session.date &&
+                        slot.column === movingSession.session.column;
+
                       // Calculate position for this session based on its column
                       const sessionColumn = slot.column ?? 0;
                       const sessionWidth = 50; // Always 50% (one column)
@@ -842,7 +853,7 @@ export default function SimpleCalendar() {
                       }
 
                       return (
-                        <div key={slot.title || sessionIndex}>
+                        <div key={slot.title || sessionIndex} style={{ opacity: isBeingMoved ? 0.3 : 1 }}>
                           {/* Partial color overlay */}
                           <div
                             style={{

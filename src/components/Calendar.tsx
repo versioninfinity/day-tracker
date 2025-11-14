@@ -1,6 +1,5 @@
-import { useState, useRef } from 'react';
+import { useState } from 'react';
 import { Session, DayData } from '../types';
-import SessionBlock from './SessionBlock';
 import SessionModal from './SessionModal';
 
 interface CalendarProps {
