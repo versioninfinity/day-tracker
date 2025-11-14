@@ -488,10 +488,20 @@ export default function SimpleCalendar() {
     }
   };
 
-  const handleDeleteSession = () => {
+  const handleDeleteSession = async () => {
     if (editingSession && sessionTitle.trim()) {
       const sessionDate = weekDates[editingSession.day];
       const dateString = getLocalDateString(sessionDate);
+
+      // Delete all file metadata for this session from database
+      if (storageService.isInitialized()) {
+        try {
+          await storageService.deleteSessionFiles(editingSession.sessionId);
+          console.log(`✅ Deleted all files for session from database`);
+        } catch (error) {
+          console.error('⚠️  Failed to delete session files from database:', error);
+        }
+      }
 
       // Remove all slots for this session (in the same column)
       const filteredSlots = slots.filter(s => {
@@ -690,8 +700,22 @@ export default function SimpleCalendar() {
     }
   };
 
-  const handleRemoveFile = (fileId: string) => {
+  const handleRemoveFile = async (fileId: string) => {
+    // Find the file to get its metadataId
+    const fileToRemove = sessionFiles.find(f => f.id === fileId);
+
+    // Remove from UI
     setSessionFiles(sessionFiles.filter(f => f.id !== fileId));
+
+    // Delete from database if it was tracked
+    if (fileToRemove?.metadataId && storageService.isInitialized()) {
+      try {
+        await storageService.deleteFileMetadata(fileToRemove.metadataId);
+        console.log(`✅ Deleted file metadata from database`);
+      } catch (error) {
+        console.error('⚠️  Failed to delete file metadata from database:', error);
+      }
+    }
   };
 
   const handleOpenFile = async (filePath: string) => {
@@ -1199,8 +1223,8 @@ export default function SimpleCalendar() {
               {fileTrackingProgress?.isTracking && (
                 <div className="mb-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
                   <div className="flex items-center gap-2 text-sm text-blue-700">
-                    <div className="animate-spin h-4 w-4 border-2 border-blue-600 border-t-transparent rounded-full"></div>
-                    <div>
+                    <div className="animate-spin h-4 w-4 border-2 border-blue-600 border-t-transparent rounded-full flex-shrink-0"></div>
+                    <div className="flex-1 min-w-0">
                       <div className="font-medium">
                         Loading<AnimatedDots />
                       </div>
@@ -1209,7 +1233,7 @@ export default function SimpleCalendar() {
                           {fileTrackingProgress.current} / {fileTrackingProgress.total} files
                         </div>
                       )}
-                      <div className="text-xs text-blue-500 truncate max-w-md" title={fileTrackingProgress.fileName}>
+                      <div className="text-xs text-blue-500 truncate" title={fileTrackingProgress.fileName}>
                         {fileTrackingProgress.fileName}
                       </div>
                     </div>

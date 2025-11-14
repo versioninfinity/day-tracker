@@ -498,6 +498,69 @@ export class StorageService {
   }
 
   /**
+   * Delete file metadata and associated file contents
+   */
+  public async deleteFileMetadata(metadataId: string): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      console.log(`🗑️  Deleting file metadata: ${metadataId}`);
+
+      // First delete associated file contents (if any)
+      await this.db.execute(
+        'DELETE FROM file_contents WHERE folder_metadata_id = ?',
+        [metadataId]
+      );
+
+      // Then delete the file metadata itself
+      await this.db.execute(
+        'DELETE FROM file_metadata WHERE id = ?',
+        [metadataId]
+      );
+
+      console.log(`  ✓ File metadata deleted`);
+    } catch (error) {
+      console.error('Failed to delete file metadata:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete all files associated with a session
+   */
+  public async deleteSessionFiles(sessionId: string): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      console.log(`🗑️  Deleting all files for session: ${sessionId}`);
+
+      // Get all file metadata IDs for this session
+      const files = await this.getSessionFiles(sessionId);
+
+      // Delete file contents for each folder
+      for (const file of files) {
+        if (file.file_type === 'folder') {
+          await this.db.execute(
+            'DELETE FROM file_contents WHERE folder_metadata_id = ?',
+            [file.id]
+          );
+        }
+      }
+
+      // Delete all file metadata for this session
+      await this.db.execute(
+        'DELETE FROM file_metadata WHERE session_id = ?',
+        [sessionId]
+      );
+
+      console.log(`  ✓ Deleted ${files.length} file(s) for session`);
+    } catch (error) {
+      console.error('Failed to delete session files:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Find folders that contain a specific file hash
    */
   public async findFoldersWithFileHash(fileHash: string): Promise<{
