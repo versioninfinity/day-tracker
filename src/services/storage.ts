@@ -11,6 +11,7 @@ import Database from '@tauri-apps/plugin-sql';
 import { mkdir, exists, BaseDirectory, stat } from '@tauri-apps/plugin-fs';
 import { appDataDir } from '@tauri-apps/api/path';
 import { getFileHash, ProgressCallback } from './fileHash';
+import { gitService } from './gitService';
 
 export interface StorageConfig {
   id: number;
@@ -29,6 +30,9 @@ export interface FileMetadata {
   file_type: 'file' | 'folder' | 'git-repo';
   modified_at: string | null;
   created_at: string;
+  // Phase 3: Shadow git repository fields
+  shadow_repo_path: string | null;
+  git_commit_hash: string | null;
 }
 
 export interface FileContent {
@@ -183,7 +187,9 @@ export class StorageService {
           file_size INTEGER,
           file_type TEXT,
           modified_at TIMESTAMP,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          shadow_repo_path TEXT,
+          git_commit_hash TEXT
         )
       `);
       console.log('  ✓ Table created: file_metadata');
@@ -379,12 +385,63 @@ export class StorageService {
       // Get modified time
       const modifiedAt = fileStats.mtime ? new Date(fileStats.mtime).toISOString() : null;
 
+      // Phase 3: Create shadow git repository for folders
+      let shadowRepoPath: string | null = null;
+      let gitCommitHash: string | null = null;
+
+      if (fileType === 'folder' && fileHash) {
+        try {
+          console.log(`\n🔧 Phase 3: Creating shadow git repository...`);
+
+          // Create shadow repo path based on file hash
+          shadowRepoPath = `${this.storagePath}/shadow-repos/${fileHash}`;
+
+          // Check if shadow repo already exists
+          const shadowRepoExists = await exists(shadowRepoPath);
+
+          if (!shadowRepoExists) {
+            // Create shadow repo directory
+            await mkdir(shadowRepoPath, { recursive: true });
+            console.log(`  ✓ Shadow repo directory created`);
+
+            // Copy folder to shadow repo
+            await gitService.copyToShadowRepo(filePath, shadowRepoPath);
+
+            // Initialize git repository
+            await gitService.initGitRepo(shadowRepoPath);
+          } else {
+            console.log(`  ✓ Shadow repo already exists, updating...`);
+
+            // Update existing shadow repo with latest files
+            await gitService.copyToShadowRepo(filePath, shadowRepoPath);
+          }
+
+          // Create commit with session metadata
+          // Note: We need session info, so we'll pass placeholder for now
+          gitCommitHash = await gitService.createCommit(
+            shadowRepoPath,
+            'Session Update',  // Will be updated later with actual session title
+            sessionId,
+            new Date().toISOString()
+          );
+
+          console.log(`  ✅ Shadow git repo created successfully`);
+          console.log(`     Repo: ${shadowRepoPath}`);
+          console.log(`     Commit: ${gitCommitHash.substring(0, 7)}`);
+        } catch (error) {
+          console.error(`  ⚠️  Failed to create shadow git repo:`, error);
+          // Continue without shadow repo if it fails
+          shadowRepoPath = null;
+          gitCommitHash = null;
+        }
+      }
+
       // Insert into database
       await this.db.execute(
         `INSERT INTO file_metadata
-         (id, session_id, file_path, file_name, file_hash, file_size, file_type, modified_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, sessionId, filePath, fileName, fileHash, fileSize, fileType, modifiedAt]
+         (id, session_id, file_path, file_name, file_hash, file_size, file_type, modified_at, shadow_repo_path, git_commit_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, sessionId, filePath, fileName, fileHash, fileSize, fileType, modifiedAt, shadowRepoPath, gitCommitHash]
       );
 
       console.log(`  ✓ File tracked with ID: ${id}`);
@@ -415,7 +472,9 @@ export class StorageService {
         file_size: fileSize,
         file_type: fileType,
         modified_at: modifiedAt,
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
+        shadow_repo_path: shadowRepoPath,
+        git_commit_hash: gitCommitHash
       };
 
       return metadata;
