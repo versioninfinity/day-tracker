@@ -93,6 +93,7 @@ export default function SimpleCalendar() {
   const [sessionNotes, setSessionNotes] = useState('');
   const [weekOffset, setWeekOffset] = useState(0); // 0 = current week, -1 = previous week, +1 = next week
   const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [isTimezoneConverting, setIsTimezoneConverting] = useState(false);
   const [fileTrackingProgress, setFileTrackingProgress] = useState<{
     isTracking: boolean;
     current: number;
@@ -107,6 +108,18 @@ export default function SimpleCalendar() {
     path: string;
     created_at: string;
   }>>([]);
+  // Timezone selector
+  const [selectedTimezone, setSelectedTimezone] = useState<string>(() => {
+    const saved = localStorage.getItem('day-tracker-timezone');
+    return saved || 'America/New_York'; // Default to ET
+  });
+
+  const timezones = [
+    { value: 'America/New_York', label: 'ET', offset: -5 },
+    { value: 'America/Chicago', label: 'CT', offset: -6 },
+    { value: 'America/Denver', label: 'MT', offset: -7 },
+    { value: 'America/Los_Angeles', label: 'PT', offset: -8 },
+  ];
 
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const hours = Array.from({ length: 24 }, (_, i) => i);
@@ -114,37 +127,271 @@ export default function SimpleCalendar() {
   // Get current date info
   const today = new Date();
 
+  // Merge contiguous sessions with the same title on the same day
+  const mergeContiguousSessions = (slots: TimeSlot[]): TimeSlot[] => {
+    const merged: TimeSlot[] = [];
+    const slotsByDateAndTitle = new Map<string, TimeSlot[]>();
+
+    // Group slots by date and title
+    slots.forEach(slot => {
+      if (!slot.title) {
+        merged.push(slot);
+        return;
+      }
+      const key = `${slot.date}_${slot.title}`;
+      if (!slotsByDateAndTitle.has(key)) {
+        slotsByDateAndTitle.set(key, []);
+      }
+      slotsByDateAndTitle.get(key)!.push(slot);
+    });
+
+    // For each group, sort by start time and merge contiguous sessions
+    slotsByDateAndTitle.forEach((group, key) => {
+      // Sort by start time
+      group.sort((a, b) => {
+        const aStart = (a.startHour || a.hour) * 60 + (a.startMinute || 0);
+        const bStart = (b.startHour || b.hour) * 60 + (b.startMinute || 0);
+        return aStart - bStart;
+      });
+
+      let i = 0;
+      while (i < group.length) {
+        const current = group[i];
+        let endHour = current.endHour!;
+        let endMinute = current.endMinute!;
+
+        // Try to merge with subsequent slots
+        let j = i + 1;
+        while (j < group.length) {
+          const next = group[j];
+          const currentEndMinutes = endHour * 60 + endMinute;
+          const nextStartMinutes = (next.startHour || next.hour) * 60 + (next.startMinute || 0);
+
+          // Check if they're contiguous (allowing 1 minute gap due to 23:59 → 00:00 split)
+          if (nextStartMinutes - currentEndMinutes <= 1) {
+            // Merge: extend end time to next's end time
+            endHour = next.endHour!;
+            endMinute = next.endMinute!;
+            j++;
+          } else {
+            break;
+          }
+        }
+
+        // Add merged slot
+        merged.push({
+          ...current,
+          endHour,
+          endMinute,
+        });
+
+        i = j;
+      }
+    });
+
+    return merged;
+  };
+
+  // Remove all Sleep/Slep entries
+  const removeAllSleepEntries = () => {
+    const filteredSlots = slots.filter(slot => {
+      const title = (slot.title || '').toLowerCase();
+      return !title.includes('sleep') && !title.includes('slep');
+    });
+    const removedCount = slots.length - filteredSlots.length;
+    setSlots(filteredSlots);
+    console.log(`✅ Removed ${removedCount} Sleep/Slep entries from localStorage`);
+    alert(`Removed ${removedCount} Sleep/Slep entries`);
+  };
+
+  // One-time fix: shift all sessions back by 3 hours
+  const shiftSessionsBack3Hours = () => {
+    const shiftedSlots: TimeSlot[] = [];
+
+    slots.forEach(slot => {
+      if (!slot.title) {
+        shiftedSlots.push(slot);
+        return;
+      }
+
+      const startHour = slot.startHour !== undefined ? slot.startHour : slot.hour;
+      const startMinute = slot.startMinute !== undefined ? slot.startMinute : 0;
+      const endHour = slot.endHour !== undefined ? slot.endHour : slot.hour + 1;
+      const endMinute = slot.endMinute !== undefined ? slot.endMinute : 0;
+
+      const startDate = new Date(slot.date + 'T00:00:00');
+      startDate.setHours(startHour, startMinute, 0, 0);
+      const endDate = new Date(slot.date + 'T00:00:00');
+      endDate.setHours(endHour, endMinute, 0, 0);
+
+      // Shift by -3 hours using milliseconds to handle day boundaries
+      const newStartDate = new Date(startDate.getTime() - 3 * 60 * 60 * 1000);
+      const newEndDate = new Date(endDate.getTime() - 3 * 60 * 60 * 1000);
+
+      // Check if session crosses midnight after shift
+      const startDateStr = getLocalDateString(newStartDate);
+      const endDateStr = getLocalDateString(newEndDate);
+
+      if (startDateStr === endDateStr) {
+        // Session stays within one day
+        shiftedSlots.push({
+          ...slot,
+          date: startDateStr,
+          day: newStartDate.getDay(),
+          hour: newStartDate.getHours(),
+          startHour: newStartDate.getHours(),
+          startMinute: newStartDate.getMinutes(),
+          endHour: newEndDate.getHours(),
+          endMinute: newEndDate.getMinutes(),
+        });
+      } else {
+        // Session crosses midnight - split into two slots
+        // First part: from start to 23:59:59 on start day
+        shiftedSlots.push({
+          ...slot,
+          date: startDateStr,
+          day: newStartDate.getDay(),
+          hour: newStartDate.getHours(),
+          startHour: newStartDate.getHours(),
+          startMinute: newStartDate.getMinutes(),
+          endHour: 23,
+          endMinute: 59,
+        });
+
+        // Second part: from 00:00 to end on next day
+        shiftedSlots.push({
+          ...slot,
+          date: endDateStr,
+          day: newEndDate.getDay(),
+          hour: 0,
+          startHour: 0,
+          startMinute: 0,
+          endHour: newEndDate.getHours(),
+          endMinute: newEndDate.getMinutes(),
+        });
+      }
+    });
+
+    const mergedSlots = mergeContiguousSessions(shiftedSlots);
+    setSlots(mergedSlots);
+    console.log(`✅ Shifted sessions back by 3 hours (${slots.length} → ${shiftedSlots.length} slots, merged to ${mergedSlots.length})`);
+  };
+
+  // One-time fix: shift all sessions forward by 3 hours
+  const shiftSessionsForward3Hours = () => {
+    const shiftedSlots: TimeSlot[] = [];
+
+    slots.forEach(slot => {
+      if (!slot.title) {
+        shiftedSlots.push(slot);
+        return;
+      }
+
+      const startHour = slot.startHour !== undefined ? slot.startHour : slot.hour;
+      const startMinute = slot.startMinute !== undefined ? slot.startMinute : 0;
+      const endHour = slot.endHour !== undefined ? slot.endHour : slot.hour + 1;
+      const endMinute = slot.endMinute !== undefined ? slot.endMinute : 0;
+
+      const startDate = new Date(slot.date + 'T00:00:00');
+      startDate.setHours(startHour, startMinute, 0, 0);
+      const endDate = new Date(slot.date + 'T00:00:00');
+      endDate.setHours(endHour, endMinute, 0, 0);
+
+      // Shift by +3 hours using milliseconds to handle day boundaries
+      const newStartDate = new Date(startDate.getTime() + 3 * 60 * 60 * 1000);
+      const newEndDate = new Date(endDate.getTime() + 3 * 60 * 60 * 1000);
+
+      // Check if session crosses midnight after shift
+      const startDateStr = getLocalDateString(newStartDate);
+      const endDateStr = getLocalDateString(newEndDate);
+
+      if (startDateStr === endDateStr) {
+        // Session stays within one day
+        shiftedSlots.push({
+          ...slot,
+          date: startDateStr,
+          day: newStartDate.getDay(),
+          hour: newStartDate.getHours(),
+          startHour: newStartDate.getHours(),
+          startMinute: newStartDate.getMinutes(),
+          endHour: newEndDate.getHours(),
+          endMinute: newEndDate.getMinutes(),
+        });
+      } else {
+        // Session crosses midnight - split into two slots
+        // First part: from start to 23:59:59 on start day
+        shiftedSlots.push({
+          ...slot,
+          date: startDateStr,
+          day: newStartDate.getDay(),
+          hour: newStartDate.getHours(),
+          startHour: newStartDate.getHours(),
+          startMinute: newStartDate.getMinutes(),
+          endHour: 23,
+          endMinute: 59,
+        });
+
+        // Second part: from 00:00 to end on next day
+        shiftedSlots.push({
+          ...slot,
+          date: endDateStr,
+          day: newEndDate.getDay(),
+          hour: 0,
+          startHour: 0,
+          startMinute: 0,
+          endHour: newEndDate.getHours(),
+          endMinute: newEndDate.getMinutes(),
+        });
+      }
+    });
+
+    const mergedSlots = mergeContiguousSessions(shiftedSlots);
+    setSlots(mergedSlots);
+    console.log(`✅ Shifted sessions forward by 3 hours (${slots.length} → ${shiftedSlots.length} slots, merged to ${mergedSlots.length})`);
+  };
+
   // Load sessions from localStorage on mount
   useEffect(() => {
-    try {
-      const savedData = localStorage.getItem('day-tracker-sessions');
-      const migrationDone = localStorage.getItem('day-tracker-migration-v2');
+    const loadAndMigrate = async () => {
+      try {
+        const savedData = localStorage.getItem('day-tracker-sessions');
+        const migrationDone = localStorage.getItem('day-tracker-migration-v2');
+        const dbMigrationDone = localStorage.getItem('day-tracker-db-migration');
 
-      // One-time migration: clear old UTC-formatted data
-      if (savedData && !migrationDone) {
-        console.log('Migrating from UTC dates to local dates - clearing old data');
-        localStorage.removeItem('day-tracker-sessions');
-        localStorage.setItem('day-tracker-migration-v2', 'done');
-      } else if (savedData) {
-        const data = JSON.parse(savedData);
-        setSlots(data.slots || []);
-        setAllLabels(data.allLabels || ['Work', 'Personal', 'Meeting', 'Project']);
-        setLabelColors(data.labelColors || [
-          { name: 'Work', color: '#3B82F6' },
-          { name: 'Personal', color: '#10B981' },
-          { name: 'Meeting', color: '#F59E0B' },
-          { name: 'Project', color: '#8B5CF6' },
-        ]);
+        // One-time migration: clear old UTC-formatted data
+        if (savedData && !migrationDone) {
+          console.log('Migrating from UTC dates to local dates - clearing old data');
+          localStorage.removeItem('day-tracker-sessions');
+          localStorage.setItem('day-tracker-migration-v2', 'done');
+        } else if (savedData) {
+          const data = JSON.parse(savedData);
+          setSlots(data.slots || []);
+          setAllLabels(data.allLabels || ['Work', 'Personal', 'Meeting', 'Project']);
+          setLabelColors(data.labelColors || [
+            { name: 'Work', color: '#3B82F6' },
+            { name: 'Personal', color: '#10B981' },
+            { name: 'Meeting', color: '#F59E0B' },
+            { name: 'Project', color: '#8B5CF6' },
+          ]);
+
+          // Migration is handled by the save effect now with deterministic IDs
+          // Mark as done to prevent re-running old migration logic
+          if (!dbMigrationDone) {
+            localStorage.setItem('day-tracker-db-migration', 'done');
+          }
+        }
+      } catch (error) {
+        console.error('Error loading sessions:', error);
       }
-    } catch (error) {
-      console.error('Error loading sessions:', error);
-    }
-    setIsInitialLoad(false);
+      setIsInitialLoad(false);
+    };
+
+    loadAndMigrate();
   }, []);
 
-  // Save sessions to localStorage whenever they change (but not on initial load)
+  // Save sessions to localStorage AND database whenever they change (but not on initial load)
   useEffect(() => {
-    if (isInitialLoad) return;
+    if (isInitialLoad || isTimezoneConverting) return;
 
     try {
       const data = {
@@ -152,8 +399,13 @@ export default function SimpleCalendar() {
         allLabels,
         labelColors,
       };
+
+      // Save to localStorage (primary storage)
       localStorage.setItem('day-tracker-sessions', JSON.stringify(data));
       console.log('Saved to localStorage:', data);
+
+      // Save to database (backup storage) - skip during timezone conversion
+      saveToDatabaseAsync(slots);
 
       // Also sync to cloud if enabled
       if (ENABLE_CLOUD_SYNC) {
@@ -163,6 +415,105 @@ export default function SimpleCalendar() {
       console.error('Error saving sessions:', error);
     }
   }, [slots, allLabels, labelColors, isInitialLoad]);
+
+  // Save timezone preference and convert all sessions when timezone changes
+  useEffect(() => {
+    const prevTimezone = localStorage.getItem('day-tracker-timezone');
+    localStorage.setItem('day-tracker-timezone', selectedTimezone);
+
+    // If timezone changed (not initial load), convert all existing sessions
+    if (prevTimezone && prevTimezone !== selectedTimezone && slots.length > 0) {
+      console.log(`🌍 Converting sessions from ${prevTimezone} to ${selectedTimezone}...`);
+      setIsTimezoneConverting(true);
+
+      const convertedSlots: TimeSlot[] = [];
+
+      slots.forEach(slot => {
+        if (!slot.title || !slot.date) {
+          convertedSlots.push(slot);
+          return;
+        }
+
+        // Parse the current slot time
+        const startHour = slot.startHour !== undefined ? slot.startHour : slot.hour;
+        const startMinute = slot.startMinute !== undefined ? slot.startMinute : 0;
+        const endHour = slot.endHour !== undefined ? slot.endHour : slot.hour + 1;
+        const endMinute = slot.endMinute !== undefined ? slot.endMinute : 0;
+
+        // Create date objects in the OLD timezone
+        const oldDate = new Date(slot.date + 'T00:00:00');
+        const startDate = new Date(oldDate);
+        startDate.setHours(startHour, startMinute, 0, 0);
+        const endDate = new Date(oldDate);
+        endDate.setHours(endHour, endMinute, 0, 0);
+
+        // Convert from old timezone to UTC, then to new timezone
+        // This is a simplified approach - we calculate the offset difference
+        const oldTz = timezones.find(tz => tz.value === prevTimezone);
+        const newTz = timezones.find(tz => tz.value === selectedTimezone);
+
+        if (oldTz && newTz) {
+          const offsetDiff = newTz.offset - oldTz.offset; // Hours difference
+
+          // Shift times - this handles day boundary crossing automatically
+          const newStartDate = new Date(startDate.getTime() + offsetDiff * 60 * 60 * 1000);
+          const newEndDate = new Date(endDate.getTime() + offsetDiff * 60 * 60 * 1000);
+
+          // Check if session crosses midnight after timezone shift
+          const startDateStr = getLocalDateString(newStartDate);
+          const endDateStr = getLocalDateString(newEndDate);
+
+          if (startDateStr === endDateStr) {
+            // Session stays within one day
+            convertedSlots.push({
+              ...slot,
+              date: startDateStr,
+              day: newStartDate.getDay(),
+              hour: newStartDate.getHours(),
+              startHour: newStartDate.getHours(),
+              startMinute: newStartDate.getMinutes(),
+              endHour: newEndDate.getHours(),
+              endMinute: newEndDate.getMinutes(),
+            });
+          } else {
+            // Session crosses midnight - split into two slots
+            // First part: from start to 23:59:59 on start day
+            convertedSlots.push({
+              ...slot,
+              date: startDateStr,
+              day: newStartDate.getDay(),
+              hour: newStartDate.getHours(),
+              startHour: newStartDate.getHours(),
+              startMinute: newStartDate.getMinutes(),
+              endHour: 23,
+              endMinute: 59,
+            });
+
+            // Second part: from 00:00 to end on next day
+            convertedSlots.push({
+              ...slot,
+              date: endDateStr,
+              day: newEndDate.getDay(),
+              hour: 0,
+              startHour: 0,
+              startMinute: 0,
+              endHour: newEndDate.getHours(),
+              endMinute: newEndDate.getMinutes(),
+            });
+          }
+        } else {
+          convertedSlots.push(slot);
+        }
+      });
+
+      const mergedSlots = mergeContiguousSessions(convertedSlots);
+      setSlots(mergedSlots);
+      console.log(`✅ Converted ${slots.length} sessions into ${convertedSlots.length} slots, merged to ${mergedSlots.length}`);
+
+      // Reset flag after conversion to allow normal saves
+      setTimeout(() => setIsTimezoneConverting(false), 100);
+    }
+  }, [selectedTimezone]);
 
   // Cloud sync functions
   const syncToCloud = async (data: { slots: TimeSlot[], allLabels: string[], labelColors: LabelColor[] }) => {
@@ -186,12 +537,126 @@ export default function SimpleCalendar() {
     }
   };
 
+  // Generate consistent session ID based on session properties
+  const generateSessionId = (slot: TimeSlot): string => {
+    const startHour = slot.startHour !== undefined ? slot.startHour : slot.hour;
+    const startMinute = slot.startMinute !== undefined ? slot.startMinute : 0;
+    const endHour = slot.endHour !== undefined ? slot.endHour : slot.hour + 1;
+    const endMinute = slot.endMinute !== undefined ? slot.endMinute : 0;
+
+    // Create a deterministic ID based on date, time, and title
+    const key = `${slot.date}_${startHour}:${startMinute}_${endHour}:${endMinute}_${slot.title}_${slot.column || 0}`;
+
+    // Simple hash function to convert string to UUID-like format
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+      hash = ((hash << 5) - hash) + key.charCodeAt(i);
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+
+    // Convert to hex and pad to create a UUID-like string
+    const hashHex = Math.abs(hash).toString(16).padStart(8, '0');
+    return `${hashHex}-${slot.date.replace(/-/g, '')}-${startHour}${startMinute}-${endHour}${endMinute}`;
+  };
+
+  // Database sync function - save sessions to SQLite
+  const saveToDatabaseAsync = async (slots: TimeSlot[]) => {
+    if (!storageService.isInitialized()) {
+      console.warn('⚠️  Storage service not initialized, skipping database save');
+      return;
+    }
+
+    try {
+      // Convert TimeSlot format to database format
+      const sessionsToSave = slots
+        .filter(slot => slot.title) // Only save slots with titles (actual sessions)
+        .map(slot => ({
+          id: generateSessionId(slot), // Use deterministic ID to prevent duplicates
+          title: slot.title!,
+          date: slot.date,
+          startHour: slot.startHour !== undefined ? slot.startHour : slot.hour,
+          startMinute: slot.startMinute !== undefined ? slot.startMinute : 0,
+          endHour: slot.endHour !== undefined ? slot.endHour : slot.hour + 1,
+          endMinute: slot.endMinute !== undefined ? slot.endMinute : 0,
+          labels: slot.labels || [],
+          notes: slot.notes || '',
+        }));
+
+      if (sessionsToSave.length > 0) {
+        await storageService.saveSessions(sessionsToSave);
+        console.log(`💾 Saved ${sessionsToSave.length} sessions to database`);
+      }
+    } catch (error) {
+      console.error('❌ Database save error:', error);
+      // Don't throw - we don't want to break the app if database save fails
+    }
+  };
+
+  // Restore sessions from database to localStorage
+  const syncFromDatabase = async () => {
+    if (!storageService.isInitialized()) {
+      alert('Storage service not initialized');
+      return;
+    }
+
+    try {
+      const confirmed = confirm('Restore sessions from database? This will replace your current sessions in the calendar view.');
+      if (!confirmed) return;
+
+      console.log('📥 Loading sessions from database...');
+      const dbSessions = await storageService.loadSessions();
+
+      // Convert database format to TimeSlot format (UTC -> selected timezone)
+      const restoredSlots: TimeSlot[] = dbSessions.map(session => {
+        const utcStart = new Date(session.start_time);
+        const utcEnd = new Date(session.end_time);
+
+        // Convert UTC to selected timezone
+        const startTime = convertUTCToTimezone(utcStart);
+        const endTime = convertUTCToTimezone(utcEnd);
+
+        return {
+          date: getLocalDateString(startTime),
+          day: startTime.getDay(),
+          hour: startTime.getHours(),
+          title: session.title,
+          labels: session.labels,
+          notes: session.notes,
+          startMinute: startTime.getMinutes(),
+          endMinute: endTime.getMinutes(),
+          startHour: startTime.getHours(),
+          endHour: endTime.getHours(),
+          column: 0,
+          sessionId: session.id,
+        };
+      });
+
+      setSlots(restoredSlots);
+      console.log(`✅ Restored ${restoredSlots.length} sessions from database`);
+      alert(`Successfully restored ${restoredSlots.length} sessions from database!`);
+    } catch (error) {
+      console.error('❌ Database restore error:', error);
+      alert('Failed to restore sessions from database. Check console for details.');
+    }
+  };
+
   // Helper to get local date string (YYYY-MM-DD) without timezone conversion
   const getLocalDateString = (date: Date): string => {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
+  };
+
+  // Convert UTC date to selected timezone
+  const convertUTCToTimezone = (utcDate: Date): Date => {
+    return new Date(utcDate.toLocaleString('en-US', { timeZone: selectedTimezone }));
+  };
+
+  // Convert selected timezone date to UTC
+  const convertTimezoneToUTC = (localDate: Date): Date => {
+    const localString = localDate.toLocaleString('en-US', { timeZone: selectedTimezone });
+    return new Date(localString + ' UTC');
   };
 
   // Calculate dates for the week starting from Sunday
@@ -591,23 +1056,43 @@ export default function SimpleCalendar() {
 
         for (const path of paths) {
           try {
+            const fileName = path.split('/').pop() || path;
             const metadata = await stat(path);
 
             // Track file in database
             let fileHash: string | undefined;
             let metadataId: string | undefined;
             let tracked = false;
+            let backupName: string | undefined;
+            let isFullBackup: boolean | undefined;
 
             // Only track if storage service is initialized
             if (storageService.isInitialized()) {
               try {
+                // Set loading state for this file
+                setFileTrackingProgress({
+                  isTracking: true,
+                  current: 0,
+                  total: 1,
+                  fileName: `Backing up ${fileName}...`,
+                });
+
                 const fileMetadata = await storageService.trackFile(editingSession.sessionId, path);
                 fileHash = fileMetadata.file_hash || undefined;
                 metadataId = fileMetadata.id;
                 tracked = true;
+                backupName = fileMetadata.backup_name || undefined;
+                isFullBackup = fileMetadata.is_full_backup === 1;
                 console.log(`✅ Tracked file: ${fileMetadata.file_name} (${fileMetadata.file_hash?.substring(0, 12)}...)`);
+                if (backupName) {
+                  console.log(`   💾 Backup: ${backupName}`);
+                }
+
+                // Clear loading state
+                setFileTrackingProgress(null);
               } catch (trackError) {
                 console.warn('⚠️  Could not track file in database:', trackError);
+                setFileTrackingProgress(null);
               }
             } else {
               console.warn('⚠️  Storage service not initialized - file will be linked but not tracked');
@@ -615,16 +1100,19 @@ export default function SimpleCalendar() {
 
             newFiles.push({
               id: crypto.randomUUID(),
-              name: path.split('/').pop() || path,
+              name: fileName,
               path,
               size: metadata.size,
               type: 'file',
               hash: fileHash,
               metadataId,
               tracked,
+              backupName,
+              isFullBackup,
             });
           } catch (error) {
             console.error('Error reading file metadata:', error);
+            setFileTrackingProgress(null);
           }
         }
 
@@ -632,6 +1120,7 @@ export default function SimpleCalendar() {
       }
     } catch (error) {
       console.error('Error selecting files:', error);
+      setFileTrackingProgress(null);
     }
   };
 
@@ -655,26 +1144,20 @@ export default function SimpleCalendar() {
         // Only track if storage service is initialized
         if (storageService.isInitialized()) {
           try {
-            // Set initial loading state
+            const folderName = selected.split('/').pop() || selected;
+
+            // Set loading state for copying
             setFileTrackingProgress({
               isTracking: true,
               current: 0,
-              total: 0,
-              fileName: 'Scanning...',
+              total: 1,
+              fileName: `Copying ${folderName}...`,
             });
 
-            // Track file with progress callback
+            // Track file (will copy folder with rsync)
             const fileMetadata = await storageService.trackFile(
               editingSession.sessionId,
-              selected,
-              (current, total, fileName) => {
-                setFileTrackingProgress({
-                  isTracking: true,
-                  current,
-                  total,
-                  fileName,
-                });
-              }
+              selected
             );
 
             fileHash = fileMetadata.file_hash || undefined;
@@ -682,9 +1165,9 @@ export default function SimpleCalendar() {
             tracked = true;
             backupName = fileMetadata.backup_name || undefined;
             isFullBackup = fileMetadata.is_full_backup === 1;
-            console.log(`✅ Tracked folder: ${fileMetadata.file_name} (${fileMetadata.file_hash?.substring(0, 12)}...)`);
+            console.log(`✅ Tracked folder: ${fileMetadata.file_name}`);
             if (backupName) {
-              console.log(`   💾 Backup: ${backupName} (${isFullBackup ? 'Full' : 'Differential'})`);
+              console.log(`   💾 Backup: ${backupName}`);
             }
 
             // Clear loading state
@@ -940,9 +1423,52 @@ export default function SimpleCalendar() {
               <button onClick={goToPreviousWeek} className="text-2xl text-gray-600 hover:text-gray-900">‹</button>
               <button onClick={goToToday} className="px-3 py-1 text-sm border border-gray-300 rounded-lg hover:bg-gray-50">Today</button>
               <button onClick={goToNextWeek} className="text-2xl text-gray-600 hover:text-gray-900">›</button>
+
+              {/* Timezone selector */}
+              <select
+                value={selectedTimezone}
+                onChange={(e) => setSelectedTimezone(e.target.value)}
+                className="ml-4 px-3 py-1 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                title="Select timezone"
+              >
+                {timezones.map(tz => (
+                  <option key={tz.value} value={tz.value}>
+                    🌍 {tz.label}
+                  </option>
+                ))}
+              </select>
+
+              <button
+                onClick={syncFromDatabase}
+                className="ml-2 px-3 py-1 text-xs text-blue-600 hover:bg-blue-50 rounded-lg border border-blue-300"
+                title="Restore sessions from database backup"
+              >
+                💾 Sync from DB
+              </button>
+              <button
+                onClick={shiftSessionsBack3Hours}
+                className="ml-2 px-3 py-1 text-xs text-orange-600 hover:bg-orange-50 rounded-lg border border-orange-300"
+                title="Shift all sessions back by 3 hours (one-time fix)"
+              >
+                ⏪ -3hrs
+              </button>
+              <button
+                onClick={shiftSessionsForward3Hours}
+                className="ml-2 px-3 py-1 text-xs text-green-600 hover:bg-green-50 rounded-lg border border-green-300"
+                title="Shift all sessions forward by 3 hours (one-time fix)"
+              >
+                ⏩ +3hrs
+              </button>
+              <button
+                onClick={removeAllSleepEntries}
+                className="ml-2 px-3 py-1 text-xs text-purple-600 hover:bg-purple-50 rounded-lg border border-purple-300"
+                title="Remove all Sleep entries from localStorage"
+              >
+                🗑️ Delete Sleep
+              </button>
               <button
                 onClick={() => setSlots([])}
-                className="ml-4 px-3 py-1 text-xs text-red-600 hover:bg-red-50 rounded-lg"
+                className="ml-2 px-3 py-1 text-xs text-red-600 hover:bg-red-50 rounded-lg"
               >
                 Clear All
               </button>
@@ -1366,16 +1892,6 @@ export default function SimpleCalendar() {
                 >
                   Add Folder
                 </button>
-                {storageService.isInitialized() && (
-                  <button
-                    onClick={handleLinkToPrevious}
-                    className="flex-1 px-3 py-2 text-sm bg-indigo-500 text-white rounded-lg hover:bg-indigo-600 transition-colors"
-                    disabled={fileTrackingProgress?.isTracking}
-                    title="Link to a previous project to store only differences"
-                  >
-                    🔗 Link to Previous
-                  </button>
-                )}
               </div>
 
               {/* Loading indicator */}
@@ -1414,8 +1930,8 @@ export default function SimpleCalendar() {
                         <div className="flex items-center gap-2">
                           <div className="font-medium truncate text-gray-800 hover:text-blue-600">{file.name}</div>
                           {file.tracked && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-700 rounded" title="Tracked in database">
-                              ✓ Tracked
+                            <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-700 rounded" title="Backed up">
+                              ✓ Backed up
                             </span>
                           )}
                         </div>
