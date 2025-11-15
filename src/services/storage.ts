@@ -11,7 +11,7 @@ import Database from '@tauri-apps/plugin-sql';
 import { mkdir, exists, BaseDirectory, stat } from '@tauri-apps/plugin-fs';
 import { appDataDir } from '@tauri-apps/api/path';
 import { getFileHash, ProgressCallback } from './fileHash';
-import { gitService } from './gitService';
+import { backupService, BackupManifest } from './backupService';
 
 export interface StorageConfig {
   id: number;
@@ -30,9 +30,14 @@ export interface FileMetadata {
   file_type: 'file' | 'folder' | 'git-repo';
   modified_at: string | null;
   created_at: string;
-  // Phase 3: Shadow git repository fields
+  // Phase 3: Shadow git repository fields (deprecated in Phase 5)
   shadow_repo_path: string | null;
   git_commit_hash: string | null;
+  // Phase 4: Project linking
+  parent_metadata_id: string | null;
+  // Phase 5: Differential backups
+  backup_name: string | null;
+  is_full_backup: number; // 0 or 1 (SQLite boolean)
 }
 
 export interface FileContent {
@@ -43,6 +48,9 @@ export interface FileContent {
   file_size: number;
   modified_at: string | null;
   created_at: string;
+  // Phase 5: Change tracking
+  change_type: 'added' | 'modified' | 'unchanged' | 'deleted' | null;
+  backup_file_path: string | null;
 }
 
 export class StorageService {
@@ -108,6 +116,10 @@ export class StorageService {
 
       // Step 4: Verify storage config
       await this.ensureStorageConfig();
+
+      // Phase 5: Initialize backup service with storage path
+      backupService.setStoragePath(this.storagePath);
+      console.log('  ✓ Backup service initialized');
 
       this.initialized = true;
       console.log('✅ Storage infrastructure initialized successfully!');
@@ -189,10 +201,41 @@ export class StorageService {
           modified_at TIMESTAMP,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           shadow_repo_path TEXT,
-          git_commit_hash TEXT
+          git_commit_hash TEXT,
+          parent_metadata_id TEXT
         )
       `);
       console.log('  ✓ Table created: file_metadata');
+
+      // Phase 4: Add parent_metadata_id column if it doesn't exist
+      try {
+        await this.db.execute(`
+          ALTER TABLE file_metadata ADD COLUMN parent_metadata_id TEXT
+        `);
+        console.log('  ✓ Column added: parent_metadata_id');
+      } catch (error) {
+        // Column might already exist, that's okay
+        console.log('  ℹ️  Column parent_metadata_id already exists or error:', error);
+      }
+
+      // Phase 5: Add differential backup columns
+      try {
+        await this.db.execute(`
+          ALTER TABLE file_metadata ADD COLUMN backup_name TEXT
+        `);
+        console.log('  ✓ Column added: backup_name');
+      } catch (error) {
+        console.log('  ℹ️  Column backup_name already exists or error:', error);
+      }
+
+      try {
+        await this.db.execute(`
+          ALTER TABLE file_metadata ADD COLUMN is_full_backup INTEGER DEFAULT 0
+        `);
+        console.log('  ✓ Column added: is_full_backup');
+      } catch (error) {
+        console.log('  ℹ️  Column is_full_backup already exists or error:', error);
+      }
 
       // Create indexes for file_metadata
       await this.db.execute(`
@@ -232,6 +275,25 @@ export class StorageService {
         CREATE INDEX IF NOT EXISTS idx_file_contents_path ON file_contents(relative_path)
       `);
       console.log('  ✓ Indexes created for file_contents');
+
+      // Phase 5: Add change tracking columns to file_contents
+      try {
+        await this.db.execute(`
+          ALTER TABLE file_contents ADD COLUMN change_type TEXT
+        `);
+        console.log('  ✓ Column added: change_type');
+      } catch (error) {
+        console.log('  ℹ️  Column change_type already exists or error:', error);
+      }
+
+      try {
+        await this.db.execute(`
+          ALTER TABLE file_contents ADD COLUMN backup_file_path TEXT
+        `);
+        console.log('  ✓ Column added: backup_file_path');
+      } catch (error) {
+        console.log('  ℹ️  Column backup_file_path already exists or error:', error);
+      }
 
       console.log('✅ Database initialized');
     } catch (error) {
@@ -341,13 +403,15 @@ export class StorageService {
   }
 
   /**
-   * Phase 2: Track file attached to a session
-   * Calculates hash, stores metadata
+   * Phase 5: Track file and optionally create backup
+   * If skipBackup is true, only hashes files and stores metadata
    */
   public async trackFile(
     sessionId: string,
     filePath: string,
-    onProgress?: ProgressCallback
+    onProgress?: ProgressCallback,
+    parentMetadataId?: string,
+    skipBackup?: boolean
   ): Promise<FileMetadata> {
     if (!this.db) throw new Error('Database not initialized');
 
@@ -373,7 +437,7 @@ export class StorageService {
         individualFiles = hashResult.files || [];
         console.log(`  ✓ Hash calculated: ${fileHash.substring(0, 12)}...`);
         if (fileType === 'folder' && individualFiles.length > 0) {
-          console.log(`  ✓ Tracked ${individualFiles.length} individual files`);
+          console.log(`  ✓ Hashed ${individualFiles.length} individual files`);
         }
       } catch (error) {
         console.warn(`  ⚠️  Could not hash file (will track without hash):`, error);
@@ -385,82 +449,86 @@ export class StorageService {
       // Get modified time
       const modifiedAt = fileStats.mtime ? new Date(fileStats.mtime).toISOString() : null;
 
-      // Phase 3: Create shadow git repository for folders
-      let shadowRepoPath: string | null = null;
-      let gitCommitHash: string | null = null;
+      // Simple backup: Just copy the entire folder
+      let backupName: string | null = null;
+      let isFullBackup = 0;
+      let fileContentsToInsert: any[] = [];
 
-      if (fileType === 'folder' && fileHash) {
+      if (fileType === 'folder' && fileHash && !skipBackup) {
         try {
-          console.log(`\n🔧 Phase 3: Creating shadow git repository...`);
+          // Generate backup name: {project_name}_{date}_{time}
+          backupName = backupService.generateBackupName(fileName);
+          const backupPath = `${this.storagePath}/backups/${backupName}`;
 
-          // Create shadow repo path based on file hash
-          shadowRepoPath = `${this.storagePath}/shadow-repos/${fileHash}`;
+          console.log(`\n💾 Creating backup: ${backupName}`);
+          console.log(`  Source: ${filePath}`);
+          console.log(`  Destination: ${backupPath}`);
 
-          // Check if shadow repo already exists
-          const shadowRepoExists = await exists(shadowRepoPath);
+          // Use rsync to copy entire folder (preserves structure and permissions)
+          const { Command } = await import('@tauri-apps/plugin-shell');
+          const rsync = await Command.create('rsync', [
+            '-a',              // archive mode (recursive, preserves everything)
+            '--exclude', '.git',  // exclude .git folders
+            filePath + '/',    // source (trailing slash = contents)
+            backupPath + '/'   // destination
+          ]);
 
-          if (!shadowRepoExists) {
-            // Create shadow repo directory
-            await mkdir(shadowRepoPath, { recursive: true });
-            console.log(`  ✓ Shadow repo directory created`);
+          console.log(`  📦 Copying folder with rsync...`);
+          const output = await rsync.execute();
 
-            // Copy folder to shadow repo
-            await gitService.copyToShadowRepo(filePath, shadowRepoPath);
+          if (output.code === 0) {
+            console.log(`  ✅ Backup created successfully`);
+            isFullBackup = 1;
 
-            // Initialize git repository
-            await gitService.initGitRepo(shadowRepoPath);
+            // Store file contents for database (if we hashed individual files)
+            if (individualFiles.length > 0) {
+              fileContentsToInsert = individualFiles.map(file => ({
+                id: crypto.randomUUID(),
+                folder_metadata_id: id,
+                relative_path: file.relativePath,
+                file_hash: file.hash,
+                file_size: file.size,
+                modified_at: file.modifiedAt ? file.modifiedAt.toISOString() : null,
+                change_type: 'added',
+                backup_file_path: `${backupPath}/${file.relativePath}`
+              }));
+            }
           } else {
-            console.log(`  ✓ Shadow repo already exists, updating...`);
-
-            // Update existing shadow repo with latest files
-            await gitService.copyToShadowRepo(filePath, shadowRepoPath);
+            console.error(`  ❌ rsync failed with code ${output.code}`);
+            console.error(output.stderr);
+            backupName = null;
           }
 
-          // Create commit with session metadata
-          // Note: We need session info, so we'll pass placeholder for now
-          gitCommitHash = await gitService.createCommit(
-            shadowRepoPath,
-            'Session Update',  // Will be updated later with actual session title
-            sessionId,
-            new Date().toISOString()
-          );
-
-          console.log(`  ✅ Shadow git repo created successfully`);
-          console.log(`     Repo: ${shadowRepoPath}`);
-          console.log(`     Commit: ${gitCommitHash.substring(0, 7)}`);
         } catch (error) {
-          console.error(`  ⚠️  Failed to create shadow git repo:`, error);
-          // Continue without shadow repo if it fails
-          shadowRepoPath = null;
-          gitCommitHash = null;
+          console.error(`  ⚠️  Failed to create backup:`, error);
+          backupName = null;
+          isFullBackup = 0;
+          fileContentsToInsert = [];
         }
       }
 
-      // Insert into database
+      // Insert file_metadata FIRST (required for foreign key constraint)
       await this.db.execute(
         `INSERT INTO file_metadata
-         (id, session_id, file_path, file_name, file_hash, file_size, file_type, modified_at, shadow_repo_path, git_commit_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, sessionId, filePath, fileName, fileHash, fileSize, fileType, modifiedAt, shadowRepoPath, gitCommitHash]
+         (id, session_id, file_path, file_name, file_hash, file_size, file_type, modified_at, backup_name, is_full_backup, parent_metadata_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, sessionId, filePath, fileName, fileHash, fileSize, fileType, modifiedAt, backupName, isFullBackup, parentMetadataId || null]
       );
 
       console.log(`  ✓ File tracked with ID: ${id}`);
 
-      // If this is a folder, store individual file contents
-      if (fileType === 'folder' && individualFiles.length > 0) {
-        console.log(`  📝 Storing ${individualFiles.length} individual file hashes...`);
-        for (const file of individualFiles) {
-          const fileContentId = crypto.randomUUID();
-          const fileModifiedAt = file.modifiedAt ? file.modifiedAt.toISOString() : null;
-
+      // Now insert file_contents (references file_metadata.id)
+      if (fileContentsToInsert.length > 0) {
+        console.log(`  📝 Storing ${fileContentsToInsert.length} file records...`);
+        for (const fileContent of fileContentsToInsert) {
           await this.db.execute(
             `INSERT INTO file_contents
-             (id, folder_metadata_id, relative_path, file_hash, file_size, modified_at)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [fileContentId, id, file.relativePath, file.hash, file.size, fileModifiedAt]
+             (id, folder_metadata_id, relative_path, file_hash, file_size, modified_at, change_type, backup_file_path)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [fileContent.id, fileContent.folder_metadata_id, fileContent.relative_path, fileContent.file_hash, fileContent.file_size, fileContent.modified_at, fileContent.change_type, fileContent.backup_file_path]
           );
         }
-        console.log(`  ✅ Stored ${individualFiles.length} file hashes in database`);
+        console.log(`  ✅ Stored ${fileContentsToInsert.length} file records`);
       }
 
       const metadata: FileMetadata = {
@@ -473,8 +541,11 @@ export class StorageService {
         file_type: fileType,
         modified_at: modifiedAt,
         created_at: new Date().toISOString(),
-        shadow_repo_path: shadowRepoPath,
-        git_commit_hash: gitCommitHash
+        shadow_repo_path: null,
+        git_commit_hash: null,
+        parent_metadata_id: parentMetadataId || null,
+        backup_name: backupName,
+        is_full_backup: isFullBackup
       };
 
       return metadata;
@@ -516,6 +587,27 @@ export class StorageService {
       return results;
     } catch (error) {
       console.error('Failed to find files by hash:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Phase 4: Get all previously tracked folders with shadow repositories
+   * Used for manual project linking
+   */
+  public async getPreviousTrackedFolders(): Promise<FileMetadata[]> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      const results = await this.db.select<FileMetadata[]>(
+        `SELECT * FROM file_metadata
+         WHERE file_type = 'folder'
+         AND shadow_repo_path IS NOT NULL
+         ORDER BY created_at DESC`
+      );
+      return results;
+    } catch (error) {
+      console.error('Failed to get previous tracked folders:', error);
       return [];
     }
   }

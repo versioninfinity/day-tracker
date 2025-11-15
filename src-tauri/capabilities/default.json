@@ -17,10 +17,12 @@
     "fs:allow-read-text-file",
     "fs:allow-write-text-file",
     "fs:allow-read-file",
+    "fs:allow-write-file",
     "fs:allow-read-dir",
     "fs:allow-exists",
     "fs:allow-create",
     "fs:allow-mkdir",
+    "fs:allow-copy-file",
     "fs:allow-app-read",
     "fs:allow-app-write",
     "fs:allow-app-read-recursive",
@@ -37,6 +39,23 @@
     "sql:allow-select",
     "sql:allow-close",
     "shell:allow-execute",
-    "shell:allow-spawn"
+    "shell:allow-spawn",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "rsync",
+          "cmd": "rsync",
+          "args": true,
+          "sidecar": false
+        },
+        {
+          "name": "git",
+          "cmd": "git",
+          "args": true,
+          "sidecar": false
+        }
+      ]
+    }
   ]
 }

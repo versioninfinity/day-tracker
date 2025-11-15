@@ -44,6 +44,9 @@ interface FileLink {
   hash?: string; // File content hash (from storage service)
   metadataId?: string; // ID in the file_metadata database table
   tracked?: boolean; // Whether this file has been tracked in the database
+  backupName?: string; // Phase 5: Name of backup (e.g., "ucmas_2025-11-14_18-30")
+  isFullBackup?: boolean; // Phase 5: Whether this is a full backup (true) or differential (false)
+  parentMetadataId?: string; // Phase 5: ID of parent project for differential backups
 }
 
 interface LabelColor {
@@ -96,6 +99,14 @@ export default function SimpleCalendar() {
     total: number;
     fileName: string;
   } | null>(null);
+  // Phase 4: Project linking state
+  const [showLinkDialog, setShowLinkDialog] = useState(false);
+  const [previousProjects, setPreviousProjects] = useState<Array<{
+    id: string;
+    name: string;
+    path: string;
+    created_at: string;
+  }>>([]);
 
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const hours = Array.from({ length: 24 }, (_, i) => i);
@@ -287,7 +298,6 @@ export default function SimpleCalendar() {
 
     if (dragStart) {
       const minute = row * 15;
-      console.log('Cell mouse enter:', day, hour, minute, 'col:', col, 'row:', row);
 
       // If moving a session, allow moving to different days/columns
       if (movingSession) {
@@ -639,6 +649,8 @@ export default function SimpleCalendar() {
         let fileHash: string | undefined;
         let metadataId: string | undefined;
         let tracked = false;
+        let backupName: string | undefined;
+        let isFullBackup: boolean | undefined;
 
         // Only track if storage service is initialized
         if (storageService.isInitialized()) {
@@ -668,7 +680,12 @@ export default function SimpleCalendar() {
             fileHash = fileMetadata.file_hash || undefined;
             metadataId = fileMetadata.id;
             tracked = true;
+            backupName = fileMetadata.backup_name || undefined;
+            isFullBackup = fileMetadata.is_full_backup === 1;
             console.log(`✅ Tracked folder: ${fileMetadata.file_name} (${fileMetadata.file_hash?.substring(0, 12)}...)`);
+            if (backupName) {
+              console.log(`   💾 Backup: ${backupName} (${isFullBackup ? 'Full' : 'Differential'})`);
+            }
 
             // Clear loading state
             setFileTrackingProgress(null);
@@ -691,11 +708,126 @@ export default function SimpleCalendar() {
             hash: fileHash,
             metadataId,
             tracked,
+            backupName,
+            isFullBackup,
           },
         ]);
       }
     } catch (error) {
       console.error('Error selecting folder:', error);
+      setFileTrackingProgress(null);
+    }
+  };
+
+  // Phase 4: Handle linking folder to previous project
+  const handleLinkToPrevious = async () => {
+    if (!editingSession) return;
+
+    try {
+      // Load previous tracked folders
+      if (!storageService.isInitialized()) {
+        console.warn('⚠️  Storage service not initialized');
+        return;
+      }
+
+      const prevFolders = await storageService.getPreviousTrackedFolders();
+      if (prevFolders.length === 0) {
+        alert('No previous projects found. Add a folder first to create a project to link to.');
+        return;
+      }
+
+      setPreviousProjects(prevFolders.map(f => ({
+        id: f.id,
+        name: f.file_name,
+        path: f.file_path,
+        created_at: f.created_at,
+      })));
+      setShowLinkDialog(true);
+    } catch (error) {
+      console.error('Error loading previous projects:', error);
+    }
+  };
+
+  const handleSelectPreviousProject = async (parentId: string) => {
+    if (!editingSession) return;
+
+    try {
+      setShowLinkDialog(false);
+
+      // Show folder picker
+      const selected = await open({
+        multiple: false,
+        directory: true,
+      });
+
+      if (selected && typeof selected === 'string') {
+        let fileHash: string | undefined;
+        let metadataId: string | undefined;
+        let tracked = false;
+        let backupName: string | undefined;
+        let isFullBackup: boolean | undefined;
+
+        // Track folder with parent link
+        if (storageService.isInitialized()) {
+          try {
+            setFileTrackingProgress({
+              isTracking: true,
+              current: 0,
+              total: 0,
+              fileName: 'Scanning...',
+            });
+
+            // Track file with parent metadata ID (creates differential backup)
+            const fileMetadata = await storageService.trackFile(
+              editingSession.sessionId,
+              selected,
+              (current, total, fileName) => {
+                setFileTrackingProgress({
+                  isTracking: true,
+                  current,
+                  total,
+                  fileName,
+                });
+              },
+              parentId  // Link to parent project
+            );
+
+            fileHash = fileMetadata.file_hash || undefined;
+            metadataId = fileMetadata.id;
+            tracked = true;
+            backupName = fileMetadata.backup_name || undefined;
+            isFullBackup = fileMetadata.is_full_backup === 1;
+            console.log(`✅ Linked folder to parent: ${fileMetadata.file_name}`);
+            if (backupName) {
+              console.log(`   💾 Differential backup: ${backupName}`);
+            }
+
+            setFileTrackingProgress(null);
+          } catch (trackError) {
+            console.warn('⚠️  Could not track folder in database:', trackError);
+            setFileTrackingProgress(null);
+          }
+        }
+
+        setSessionFiles([
+          ...sessionFiles,
+          {
+            id: crypto.randomUUID(),
+            name: selected.split('/').pop() || selected,
+            path: selected,
+            size: 0,
+            type: 'folder',
+            hash: fileHash,
+            metadataId,
+            tracked,
+            backupName,
+            isFullBackup,
+            parentMetadataId: parentId,
+          },
+        ]);
+      }
+    } catch (error) {
+      console.error('Error linking to previous project:', error);
       setFileTrackingProgress(null);
     }
   };
@@ -723,6 +855,23 @@ export default function SimpleCalendar() {
       await openPath(filePath);
     } catch (error) {
       console.error('Error opening file/folder:', error);
+    }
+  };
+
+  // Open backup folder directly (simple folder copy)
+  const handleOpenBackup = async (backupName: string) => {
+    try {
+      console.log(`📸 Opening backup: ${backupName}`);
+
+      // Get storage path from storage service
+      const storagePath = storageService.getStoragePath();
+      const backupPath = `${storagePath}/backups/${backupName}`;
+
+      await openPath(backupPath);
+
+      console.log(`✅ Opened backup at: ${backupPath}`);
+    } catch (error) {
+      console.error('❌ Failed to open backup:', error);
     }
   };
 
@@ -1217,6 +1366,16 @@ export default function SimpleCalendar() {
                 >
                   Add Folder
                 </button>
+                {storageService.isInitialized() && (
+                  <button
+                    onClick={handleLinkToPrevious}
+                    className="flex-1 px-3 py-2 text-sm bg-indigo-500 text-white rounded-lg hover:bg-indigo-600 transition-colors"
+                    disabled={fileTrackingProgress?.isTracking}
+                    title="Link to a previous project to store only differences"
+                  >
+                    🔗 Link to Previous
+                  </button>
+                )}
               </div>
 
               {/* Loading indicator */}
@@ -1276,6 +1435,15 @@ export default function SimpleCalendar() {
                         >
                           Open
                         </button>
+                        {file.backupName && (
+                          <button
+                            onClick={() => handleOpenBackup(file.backupName!)}
+                            className="px-2 py-1 text-[10px] bg-purple-500 text-white rounded hover:bg-purple-600 transition-colors"
+                            title={`Open backup: ${file.backupName} (${file.isFullBackup ? 'Full' : 'Differential'})`}
+                          >
+                            📸 Backup
+                          </button>
+                        )}
                         <button
                           onClick={() => handleRemoveFile(file.id)}
                           className="text-gray-400 hover:text-red-500 text-lg"
@@ -1330,6 +1498,43 @@ export default function SimpleCalendar() {
                   Save
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 4: Project linking dialog */}
+      {showLinkDialog && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 max-w-2xl w-full mx-4 max-h-[80vh] overflow-y-auto">
+            <h3 className="text-lg font-semibold mb-4">Select Previous Project to Link</h3>
+            <p className="text-sm text-gray-600 mb-4">
+              Choose a previous project to link to. Only differences will be stored.
+            </p>
+
+            <div className="space-y-2 mb-6">
+              {previousProjects.map(project => (
+                <button
+                  key={project.id}
+                  onClick={() => handleSelectPreviousProject(project.id)}
+                  className="w-full text-left p-4 border border-gray-200 rounded-lg hover:bg-indigo-50 hover:border-indigo-300 transition-colors"
+                >
+                  <div className="font-medium text-gray-800">{project.name}</div>
+                  <div className="text-xs text-gray-500 truncate">{project.path}</div>
+                  <div className="text-xs text-gray-400 mt-1">
+                    Created: {new Date(project.created_at).toLocaleString()}
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setShowLinkDialog(false)}
+                className="px-4 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+              >
+                Cancel
+              </button>
             </div>
           </div>
         </div>
