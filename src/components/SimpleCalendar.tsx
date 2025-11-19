@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { open } from '@tauri-apps/plugin-dialog';
+import { open, ask } from '@tauri-apps/plugin-dialog';
 import { stat } from '@tauri-apps/plugin-fs';
 import { openPath } from '@tauri-apps/plugin-opener';
 import { storageService } from '../services/storage';
@@ -544,8 +544,8 @@ export default function SimpleCalendar() {
     const endHour = slot.endHour !== undefined ? slot.endHour : slot.hour + 1;
     const endMinute = slot.endMinute !== undefined ? slot.endMinute : 0;
 
-    // Create a deterministic ID based on date, time, and title
-    const key = `${slot.date}_${startHour}:${startMinute}_${endHour}:${endMinute}_${slot.title}_${slot.column || 0}`;
+    // Create a deterministic ID based on date, time, and title (NOT column, so moving doesn't create duplicates)
+    const key = `${slot.date}_${startHour}:${startMinute}_${endHour}:${endMinute}_${slot.title}`;
 
     // Simple hash function to convert string to UUID-like format
     let hash = 0;
@@ -580,6 +580,7 @@ export default function SimpleCalendar() {
           endMinute: slot.endMinute !== undefined ? slot.endMinute : 0,
           labels: slot.labels || [],
           notes: slot.notes || '',
+          column: slot.column || 0,
         }));
 
       if (sessionsToSave.length > 0) {
@@ -600,37 +601,59 @@ export default function SimpleCalendar() {
     }
 
     try {
-      const confirmed = confirm('Restore sessions from database? This will replace your current sessions in the calendar view.');
+      const confirmed = await ask('Restore sessions from database? This will replace your current sessions in the calendar view.', {
+        title: 'Restore from Database',
+        kind: 'info',
+      });
       if (!confirmed) return;
 
       console.log('📥 Loading sessions from database...');
       const dbSessions = await storageService.loadSessions();
 
       // Convert database format to TimeSlot format (UTC -> selected timezone)
-      const restoredSlots: TimeSlot[] = dbSessions.map(session => {
-        const utcStart = new Date(session.start_time);
-        const utcEnd = new Date(session.end_time);
+      const restoredSlots: TimeSlot[] = await Promise.all(
+        dbSessions.map(async session => {
+          const utcStart = new Date(session.start_time);
+          const utcEnd = new Date(session.end_time);
 
-        // Convert UTC to selected timezone
-        const startTime = convertUTCToTimezone(utcStart);
-        const endTime = convertUTCToTimezone(utcEnd);
+          // Convert UTC to selected timezone
+          const startTime = convertUTCToTimezone(utcStart);
+          const endTime = convertUTCToTimezone(utcEnd);
 
-        return {
-          date: getLocalDateString(startTime),
-          day: startTime.getDay(),
-          hour: startTime.getHours(),
-          title: session.title,
-          labels: session.labels,
-          notes: session.notes,
-          startMinute: startTime.getMinutes(),
-          endMinute: endTime.getMinutes(),
-          startHour: startTime.getHours(),
-          endHour: endTime.getHours(),
-          column: 0,
-          sessionId: session.id,
-        };
-      });
+          // Restore linked files for this session
+          const sessionFiles = await storageService.getSessionFiles(session.id);
+          const files = sessionFiles.map(fileMetadata => ({
+            id: fileMetadata.id,
+            name: fileMetadata.file_name,
+            path: fileMetadata.file_path,
+            size: fileMetadata.file_size,
+            type: fileMetadata.file_type as 'file' | 'folder',
+            hash: fileMetadata.file_hash || undefined,
+            metadataId: fileMetadata.id,
+            tracked: true,
+            backupName: fileMetadata.backup_name || undefined,
+            isFullBackup: fileMetadata.is_full_backup === 1,
+          }));
 
+          return {
+            date: getLocalDateString(startTime),
+            day: startTime.getDay(),
+            hour: startTime.getHours(),
+            title: session.title,
+            labels: session.labels,
+            notes: session.notes,
+            startMinute: startTime.getMinutes(),
+            endMinute: endTime.getMinutes(),
+            startHour: startTime.getHours(),
+            endHour: endTime.getHours(),
+            column: session.column_index || 0,
+            sessionId: session.id,
+            files,
+          };
+        })
+      );
+
+      console.log('📦 Restored slots:', restoredSlots);
       setSlots(restoredSlots);
       console.log(`✅ Restored ${restoredSlots.length} sessions from database`);
       alert(`Successfully restored ${restoredSlots.length} sessions from database!`);
@@ -1445,33 +1468,6 @@ export default function SimpleCalendar() {
               >
                 💾 Sync from DB
               </button>
-              <button
-                onClick={shiftSessionsBack3Hours}
-                className="ml-2 px-3 py-1 text-xs text-orange-600 hover:bg-orange-50 rounded-lg border border-orange-300"
-                title="Shift all sessions back by 3 hours (one-time fix)"
-              >
-                ⏪ -3hrs
-              </button>
-              <button
-                onClick={shiftSessionsForward3Hours}
-                className="ml-2 px-3 py-1 text-xs text-green-600 hover:bg-green-50 rounded-lg border border-green-300"
-                title="Shift all sessions forward by 3 hours (one-time fix)"
-              >
-                ⏩ +3hrs
-              </button>
-              <button
-                onClick={removeAllSleepEntries}
-                className="ml-2 px-3 py-1 text-xs text-purple-600 hover:bg-purple-50 rounded-lg border border-purple-300"
-                title="Remove all Sleep entries from localStorage"
-              >
-                🗑️ Delete Sleep
-              </button>
-              <button
-                onClick={() => setSlots([])}
-                className="ml-2 px-3 py-1 text-xs text-red-600 hover:bg-red-50 rounded-lg"
-              >
-                Clear All
-              </button>
             </div>
           </div>
         </div>
@@ -1577,9 +1573,20 @@ export default function SimpleCalendar() {
                         const cellMinute = row * 15;
                         const isCellInDrag = dragStart && dragEnd &&
                           dragStart.day === dayIdx &&
-                          dragStart.col === col &&
+                          dragEnd.day === dayIdx &&
                           dragEnd.col === col &&
                           (() => {
+                            // When moving between columns, only show preview at destination
+                            if (movingSession && dragStart.col !== dragEnd.col) {
+                              // Show the full session duration at the destination column
+                              const sessionDuration = Math.abs((dragStart.hour * 60 + dragStart.minute) - (dragEnd.hour * 60 + dragEnd.minute));
+                              const destStart = dragEnd.hour * 60 + dragEnd.minute;
+                              const destEnd = destStart + (movingSession.endMinute! - movingSession.startMinute! + (movingSession.endHour! - movingSession.startHour!) * 60);
+                              const cellStart = hour * 60 + cellMinute;
+                              const cellEnd = cellStart + 15;
+                              return cellStart < destEnd && cellEnd > destStart;
+                            }
+                            // Normal same-column drag
                             const startMin = Math.min(dragStart.hour * 60 + dragStart.minute, dragEnd.hour * 60 + dragEnd.minute);
                             const endMin = Math.max(dragStart.hour * 60 + dragStart.minute, dragEnd.hour * 60 + dragEnd.minute) + 15;
                             const cellStart = hour * 60 + cellMinute;

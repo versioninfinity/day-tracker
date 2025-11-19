@@ -259,9 +259,6 @@ export default function SessionModal({
                     <div className="font-medium text-sm truncate">{file.name}</div>
                     <div className="text-xs text-gray-500 truncate">{file.path}</div>
                     <div className="text-xs text-gray-400">{formatFileSize(file.size)}</div>
-                    {file.linkedFromSessionId && (
-                      <div className="text-xs text-blue-600">Linked from previous session</div>
-                    )}
                   </div>
                   <button
                     onClick={() => handleRemoveFile(file.id)}

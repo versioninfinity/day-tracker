@@ -295,6 +295,39 @@ export class StorageService {
         console.log('  ℹ️  Column backup_file_path already exists or error:', error);
       }
 
+      // Phase 6: Create sessions table for dual storage
+      await this.db.execute(`
+        CREATE TABLE IF NOT EXISTS sessions (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          start_time TEXT NOT NULL,
+          end_time TEXT NOT NULL,
+          labels TEXT,
+          notes TEXT,
+          column_index INTEGER DEFAULT 0,
+          created_at TEXT,
+          updated_at TEXT
+        )
+      `);
+      console.log('  ✓ Table created: sessions');
+
+      // Migration: Add column_index to existing sessions table if it doesn't exist
+      try {
+        await this.db.execute(`
+          ALTER TABLE sessions ADD COLUMN column_index INTEGER DEFAULT 0
+        `);
+        console.log('  ✓ Added column_index to sessions table');
+      } catch (error) {
+        // Column already exists, ignore error
+        console.log('  ✓ column_index already exists in sessions table');
+      }
+
+      // Create index for sessions by time
+      await this.db.execute(`
+        CREATE INDEX IF NOT EXISTS idx_sessions_time ON sessions(start_time, end_time)
+      `);
+      console.log('  ✓ Indexes created for sessions');
+
       console.log('✅ Database initialized');
     } catch (error) {
       console.error('  ✗ Database initialization failed:', error);
@@ -425,23 +458,12 @@ export class StorageService {
       const fileStats = await stat(filePath);
       const fileType: 'file' | 'folder' | 'git-repo' = fileStats.isDirectory ? 'folder' : 'file';
 
-      // Calculate hash and size
+      // Skip hashing - just copy files/folders directly
       let fileHash: string | null = null;
-      let fileSize: number | null = null;
+      let fileSize: number | null = fileStats.size || 0;
       let individualFiles: any[] = [];
 
-      try {
-        const hashResult = await getFileHash(filePath, onProgress);
-        fileHash = hashResult.hash;
-        fileSize = hashResult.size;
-        individualFiles = hashResult.files || [];
-        console.log(`  ✓ Hash calculated: ${fileHash.substring(0, 12)}...`);
-        if (fileType === 'folder' && individualFiles.length > 0) {
-          console.log(`  ✓ Hashed ${individualFiles.length} individual files`);
-        }
-      } catch (error) {
-        console.warn(`  ⚠️  Could not hash file (will track without hash):`, error);
-      }
+      console.log(`  📦 Skipping hash - will copy directly`);
 
       // Generate ID
       const id = crypto.randomUUID();
@@ -449,12 +471,12 @@ export class StorageService {
       // Get modified time
       const modifiedAt = fileStats.mtime ? new Date(fileStats.mtime).toISOString() : null;
 
-      // Simple backup: Just copy the entire folder
+      // Simple backup: Copy folders or files
       let backupName: string | null = null;
       let isFullBackup = 0;
       let fileContentsToInsert: any[] = [];
 
-      if (fileType === 'folder' && fileHash && !skipBackup) {
+      if (!skipBackup) {
         try {
           // Generate backup name: {project_name}_{date}_{time}
           backupName = backupService.generateBackupName(fileName);
@@ -464,39 +486,80 @@ export class StorageService {
           console.log(`  Source: ${filePath}`);
           console.log(`  Destination: ${backupPath}`);
 
-          // Use rsync to copy entire folder (preserves structure and permissions)
-          const { Command } = await import('@tauri-apps/plugin-shell');
-          const rsync = await Command.create('rsync', [
-            '-a',              // archive mode (recursive, preserves everything)
-            '--exclude', '.git',  // exclude .git folders
-            filePath + '/',    // source (trailing slash = contents)
-            backupPath + '/'   // destination
-          ]);
+          if (fileType === 'folder') {
+            // Use rsync to copy entire folder (preserves structure and permissions)
+            const { Command } = await import('@tauri-apps/plugin-shell');
+            const rsync = await Command.create('rsync', [
+              '-a',              // archive mode (recursive, preserves everything)
+              '--exclude', '.git',  // exclude .git folders
+              filePath + '/',    // source (trailing slash = contents)
+              backupPath + '/'   // destination
+            ]);
 
-          console.log(`  📦 Copying folder with rsync...`);
-          const output = await rsync.execute();
+            console.log(`  📦 Copying folder with rsync...`);
+            const output = await rsync.execute();
 
-          if (output.code === 0) {
-            console.log(`  ✅ Backup created successfully`);
-            isFullBackup = 1;
+            if (output.code === 0) {
+              console.log(`  ✅ Backup created successfully`);
+              isFullBackup = 1;
 
-            // Store file contents for database (if we hashed individual files)
-            if (individualFiles.length > 0) {
-              fileContentsToInsert = individualFiles.map(file => ({
-                id: crypto.randomUUID(),
-                folder_metadata_id: id,
-                relative_path: file.relativePath,
-                file_hash: file.hash,
-                file_size: file.size,
-                modified_at: file.modifiedAt ? file.modifiedAt.toISOString() : null,
-                change_type: 'added',
-                backup_file_path: `${backupPath}/${file.relativePath}`
-              }));
+              // Store file contents for database (if we hashed individual files)
+              if (individualFiles.length > 0) {
+                fileContentsToInsert = individualFiles.map(file => ({
+                  id: crypto.randomUUID(),
+                  folder_metadata_id: id,
+                  relative_path: file.relativePath,
+                  file_hash: file.hash,
+                  file_size: file.size,
+                  modified_at: file.modifiedAt ? file.modifiedAt.toISOString() : null,
+                  change_type: 'added',
+                  backup_file_path: `${backupPath}/${file.relativePath}`
+                }));
+              }
+            } else {
+              console.error(`  ❌ rsync failed with code ${output.code}`);
+              console.error(output.stderr);
+              backupName = null;
             }
           } else {
-            console.error(`  ❌ rsync failed with code ${output.code}`);
-            console.error(output.stderr);
-            backupName = null;
+            // For individual files, use cp command to copy
+            const { Command } = await import('@tauri-apps/plugin-shell');
+
+            // Create backup directory for the file
+            const mkdirCmd = await Command.create('mkdir', ['-p', backupPath]);
+            await mkdirCmd.execute();
+
+            // Copy the file to backup location
+            const cp = await Command.create('cp', [
+              '-p',              // preserve file attributes
+              filePath,          // source file
+              backupPath + '/'   // destination directory
+            ]);
+
+            console.log(`  📄 Copying file with cp...`);
+            const output = await cp.execute();
+
+            if (output.code === 0) {
+              console.log(`  ✅ File backup created successfully`);
+              isFullBackup = 1;
+
+              // Store file content record for individual file
+              const backupFilePath = `${backupPath}/${fileName}`;
+              fileContentsToInsert = [{
+                id: crypto.randomUUID(),
+                folder_metadata_id: id,
+                relative_path: fileName,
+                file_hash: fileHash,
+                file_size: fileSize,
+                modified_at: modifiedAt,
+                change_type: 'added',
+                backup_file_path: backupFilePath
+              }];
+            } else {
+              console.error(`  ❌ cp failed with code ${output.code}`);
+              console.error(output.stderr);
+              backupName = null;
+            }
           }
 
         } catch (error) {
@@ -788,6 +851,164 @@ export class StorageService {
     } catch (error) {
       console.error('Failed to calculate folder similarity:', error);
       return 0;
+    }
+  }
+
+  /**
+   * Save a single session to database
+   */
+  public async saveSession(session: {
+    id: string;
+    title: string;
+    date: string;
+    startHour: number;
+    startMinute: number;
+    endHour: number;
+    endMinute: number;
+    labels: string[];
+    notes?: string;
+    column?: number;
+    createdAt?: Date;
+    updatedAt?: Date;
+  }): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      // Create ISO timestamps for start and end times
+      // Parse date as YYYY-MM-DD and create date in local time (not UTC)
+      const [year, month, day] = session.date.split('-').map(Number);
+      const startTime = new Date(year, month - 1, day, session.startHour, session.startMinute, 0, 0);
+      const endTime = new Date(year, month - 1, day, session.endHour, session.endMinute, 0, 0);
+
+      const now = new Date().toISOString();
+
+      await this.db.execute(
+        `INSERT OR REPLACE INTO sessions
+         (id, title, start_time, end_time, labels, notes, column_index, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          session.id,
+          session.title,
+          startTime.toISOString(),
+          endTime.toISOString(),
+          JSON.stringify(session.labels),
+          session.notes || null,
+          session.column || 0,
+          session.createdAt?.toISOString() || now,
+          now
+        ]
+      );
+    } catch (error) {
+      console.error('Failed to save session:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Save multiple sessions to database (bulk operation)
+   */
+  public async saveSessions(sessions: {
+    id: string;
+    title: string;
+    date: string;
+    startHour: number;
+    startMinute: number;
+    endHour: number;
+    endMinute: number;
+    labels: string[];
+    notes?: string;
+    column?: number;
+  }[]): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      for (const session of sessions) {
+        await this.saveSession(session);
+      }
+      console.log(`✅ Saved ${sessions.length} sessions to database`);
+    } catch (error) {
+      console.error('Failed to save sessions:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Load all sessions from database
+   */
+  public async loadSessions(): Promise<any[]> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      const sessions = await this.db.select<any[]>(
+        'SELECT * FROM sessions ORDER BY start_time ASC'
+      );
+
+      // Parse JSON labels
+      return sessions.map(session => ({
+        ...session,
+        labels: session.labels ? JSON.parse(session.labels) : []
+      }));
+    } catch (error) {
+      console.error('Failed to load sessions:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get a single session by ID
+   */
+  public async getSession(sessionId: string): Promise<any | null> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      const sessions = await this.db.select<any[]>(
+        'SELECT * FROM sessions WHERE id = ?',
+        [sessionId]
+      );
+
+      if (sessions.length === 0) return null;
+
+      const session = sessions[0];
+      return {
+        ...session,
+        labels: session.labels ? JSON.parse(session.labels) : []
+      };
+    } catch (error) {
+      console.error('Failed to get session:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Delete a session from database
+   */
+  public async deleteSession(sessionId: string): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      await this.db.execute(
+        'DELETE FROM sessions WHERE id = ?',
+        [sessionId]
+      );
+      console.log(`✅ Deleted session ${sessionId} from database`);
+    } catch (error) {
+      console.error('Failed to delete session:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete all sessions from database
+   */
+  public async deleteAllSessions(): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    try {
+      await this.db.execute('DELETE FROM sessions');
+      console.log('✅ Deleted all sessions from database');
+    } catch (error) {
+      console.error('Failed to delete all sessions:', error);
+      throw error;
     }
   }
 
