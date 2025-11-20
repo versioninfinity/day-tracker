@@ -1742,9 +1742,14 @@ export default function SimpleCalendar() {
                       >
                         <div className="flex items-center gap-2">
                           <div className="font-medium truncate text-gray-800 hover:text-blue-600">{file.name}</div>
-                          {file.tracked && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-700 rounded" title="Backed up">
+                          {file.backupName && (
+                            <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-700 rounded" title={`Backed up: ${file.backupName}`}>
                               ✓ Backed up
+                            </span>
+                          )}
+                          {file.tracked && !file.backupName && (
+                            <span className="text-[10px] px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded" title="Tracked in database (no backup copy)">
+                              ✓ Tracked
                             </span>
                           )}
                         </div>
