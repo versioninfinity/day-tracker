@@ -10,8 +10,8 @@
 import Database from '@tauri-apps/plugin-sql';
 import { mkdir, exists, BaseDirectory, stat } from '@tauri-apps/plugin-fs';
 import { appDataDir } from '@tauri-apps/api/path';
-import { getFileHash, ProgressCallback } from './fileHash';
-import { backupService, BackupManifest } from './backupService';
+import { getFileHash as _getFileHash, ProgressCallback } from './fileHash';
+import { backupService, BackupManifest as _BackupManifest } from './backupService';
 
 export interface StorageConfig {
   id: number;
@@ -442,7 +442,7 @@ export class StorageService {
   public async trackFile(
     sessionId: string,
     filePath: string,
-    onProgress?: ProgressCallback,
+    _onProgress?: ProgressCallback,
     parentMetadataId?: string,
     skipBackup?: boolean
   ): Promise<FileMetadata> {

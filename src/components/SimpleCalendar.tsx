@@ -102,7 +102,7 @@ export default function SimpleCalendar() {
   } | null>(null);
   // Phase 4: Project linking state
   const [showLinkDialog, setShowLinkDialog] = useState(false);
-  const [previousProjects, setPreviousProjects] = useState<Array<{
+  const [previousProjects, _setPreviousProjects] = useState<Array<{
     id: string;
     name: string;
     path: string;
@@ -146,7 +146,7 @@ export default function SimpleCalendar() {
     });
 
     // For each group, sort by start time and merge contiguous sessions
-    slotsByDateAndTitle.forEach((group, key) => {
+    slotsByDateAndTitle.forEach((group, _key) => {
       // Sort by start time
       group.sort((a, b) => {
         const aStart = (a.startHour || a.hour) * 60 + (a.startMinute || 0);
@@ -190,164 +190,6 @@ export default function SimpleCalendar() {
     });
 
     return merged;
-  };
-
-  // Remove all Sleep/Slep entries
-  const removeAllSleepEntries = () => {
-    const filteredSlots = slots.filter(slot => {
-      const title = (slot.title || '').toLowerCase();
-      return !title.includes('sleep') && !title.includes('slep');
-    });
-    const removedCount = slots.length - filteredSlots.length;
-    setSlots(filteredSlots);
-    console.log(`✅ Removed ${removedCount} Sleep/Slep entries from localStorage`);
-    alert(`Removed ${removedCount} Sleep/Slep entries`);
-  };
-
-  // One-time fix: shift all sessions back by 3 hours
-  const shiftSessionsBack3Hours = () => {
-    const shiftedSlots: TimeSlot[] = [];
-
-    slots.forEach(slot => {
-      if (!slot.title) {
-        shiftedSlots.push(slot);
-        return;
-      }
-
-      const startHour = slot.startHour !== undefined ? slot.startHour : slot.hour;
-      const startMinute = slot.startMinute !== undefined ? slot.startMinute : 0;
-      const endHour = slot.endHour !== undefined ? slot.endHour : slot.hour + 1;
-      const endMinute = slot.endMinute !== undefined ? slot.endMinute : 0;
-
-      const startDate = new Date(slot.date + 'T00:00:00');
-      startDate.setHours(startHour, startMinute, 0, 0);
-      const endDate = new Date(slot.date + 'T00:00:00');
-      endDate.setHours(endHour, endMinute, 0, 0);
-
-      // Shift by -3 hours using milliseconds to handle day boundaries
-      const newStartDate = new Date(startDate.getTime() - 3 * 60 * 60 * 1000);
-      const newEndDate = new Date(endDate.getTime() - 3 * 60 * 60 * 1000);
-
-      // Check if session crosses midnight after shift
-      const startDateStr = getLocalDateString(newStartDate);
-      const endDateStr = getLocalDateString(newEndDate);
-
-      if (startDateStr === endDateStr) {
-        // Session stays within one day
-        shiftedSlots.push({
-          ...slot,
-          date: startDateStr,
-          day: newStartDate.getDay(),
-          hour: newStartDate.getHours(),
-          startHour: newStartDate.getHours(),
-          startMinute: newStartDate.getMinutes(),
-          endHour: newEndDate.getHours(),
-          endMinute: newEndDate.getMinutes(),
-        });
-      } else {
-        // Session crosses midnight - split into two slots
-        // First part: from start to 23:59:59 on start day
-        shiftedSlots.push({
-          ...slot,
-          date: startDateStr,
-          day: newStartDate.getDay(),
-          hour: newStartDate.getHours(),
-          startHour: newStartDate.getHours(),
-          startMinute: newStartDate.getMinutes(),
-          endHour: 23,
-          endMinute: 59,
-        });
-
-        // Second part: from 00:00 to end on next day
-        shiftedSlots.push({
-          ...slot,
-          date: endDateStr,
-          day: newEndDate.getDay(),
-          hour: 0,
-          startHour: 0,
-          startMinute: 0,
-          endHour: newEndDate.getHours(),
-          endMinute: newEndDate.getMinutes(),
-        });
-      }
-    });
-
-    const mergedSlots = mergeContiguousSessions(shiftedSlots);
-    setSlots(mergedSlots);
-    console.log(`✅ Shifted sessions back by 3 hours (${slots.length} → ${shiftedSlots.length} slots, merged to ${mergedSlots.length})`);
-  };
-
-  // One-time fix: shift all sessions forward by 3 hours
-  const shiftSessionsForward3Hours = () => {
-    const shiftedSlots: TimeSlot[] = [];
-
-    slots.forEach(slot => {
-      if (!slot.title) {
-        shiftedSlots.push(slot);
-        return;
-      }
-
-      const startHour = slot.startHour !== undefined ? slot.startHour : slot.hour;
-      const startMinute = slot.startMinute !== undefined ? slot.startMinute : 0;
-      const endHour = slot.endHour !== undefined ? slot.endHour : slot.hour + 1;
-      const endMinute = slot.endMinute !== undefined ? slot.endMinute : 0;
-
-      const startDate = new Date(slot.date + 'T00:00:00');
-      startDate.setHours(startHour, startMinute, 0, 0);
-      const endDate = new Date(slot.date + 'T00:00:00');
-      endDate.setHours(endHour, endMinute, 0, 0);
-
-      // Shift by +3 hours using milliseconds to handle day boundaries
-      const newStartDate = new Date(startDate.getTime() + 3 * 60 * 60 * 1000);
-      const newEndDate = new Date(endDate.getTime() + 3 * 60 * 60 * 1000);
-
-      // Check if session crosses midnight after shift
-      const startDateStr = getLocalDateString(newStartDate);
-      const endDateStr = getLocalDateString(newEndDate);
-
-      if (startDateStr === endDateStr) {
-        // Session stays within one day
-        shiftedSlots.push({
-          ...slot,
-          date: startDateStr,
-          day: newStartDate.getDay(),
-          hour: newStartDate.getHours(),
-          startHour: newStartDate.getHours(),
-          startMinute: newStartDate.getMinutes(),
-          endHour: newEndDate.getHours(),
-          endMinute: newEndDate.getMinutes(),
-        });
-      } else {
-        // Session crosses midnight - split into two slots
-        // First part: from start to 23:59:59 on start day
-        shiftedSlots.push({
-          ...slot,
-          date: startDateStr,
-          day: newStartDate.getDay(),
-          hour: newStartDate.getHours(),
-          startHour: newStartDate.getHours(),
-          startMinute: newStartDate.getMinutes(),
-          endHour: 23,
-          endMinute: 59,
-        });
-
-        // Second part: from 00:00 to end on next day
-        shiftedSlots.push({
-          ...slot,
-          date: endDateStr,
-          day: newEndDate.getDay(),
-          hour: 0,
-          startHour: 0,
-          startMinute: 0,
-          endHour: newEndDate.getHours(),
-          endMinute: newEndDate.getMinutes(),
-        });
-      }
-    });
-
-    const mergedSlots = mergeContiguousSessions(shiftedSlots);
-    setSlots(mergedSlots);
-    console.log(`✅ Shifted sessions forward by 3 hours (${slots.length} → ${shiftedSlots.length} slots, merged to ${mergedSlots.length})`);
   };
 
   // Load sessions from localStorage on mount
@@ -626,7 +468,7 @@ export default function SimpleCalendar() {
             id: fileMetadata.id,
             name: fileMetadata.file_name,
             path: fileMetadata.file_path,
-            size: fileMetadata.file_size,
+            size: fileMetadata.file_size || 0,
             type: fileMetadata.file_type as 'file' | 'folder',
             hash: fileMetadata.file_hash || undefined,
             metadataId: fileMetadata.id,
@@ -674,12 +516,6 @@ export default function SimpleCalendar() {
   // Convert UTC date to selected timezone
   const convertUTCToTimezone = (utcDate: Date): Date => {
     return new Date(utcDate.toLocaleString('en-US', { timeZone: selectedTimezone }));
-  };
-
-  // Convert selected timezone date to UTC
-  const convertTimezoneToUTC = (localDate: Date): Date => {
-    const localString = localDate.toLocaleString('en-US', { timeZone: selectedTimezone });
-    return new Date(localString + ' UTC');
   };
 
   // Calculate dates for the week starting from Sunday
@@ -1225,35 +1061,6 @@ export default function SimpleCalendar() {
     }
   };
 
-  // Phase 4: Handle linking folder to previous project
-  const handleLinkToPrevious = async () => {
-    if (!editingSession) return;
-
-    try {
-      // Load previous tracked folders
-      if (!storageService.isInitialized()) {
-        console.warn('⚠️  Storage service not initialized');
-        return;
-      }
-
-      const prevFolders = await storageService.getPreviousTrackedFolders();
-      if (prevFolders.length === 0) {
-        alert('No previous projects found. Add a folder first to create a project to link to.');
-        return;
-      }
-
-      setPreviousProjects(prevFolders.map(f => ({
-        id: f.id,
-        name: f.file_name,
-        path: f.file_path,
-        created_at: f.created_at,
-      })));
-      setShowLinkDialog(true);
-    } catch (error) {
-      console.error('Error loading previous projects:', error);
-    }
-  };
-
   const handleSelectPreviousProject = async (parentId: string) => {
     if (!editingSession) return;
 
@@ -1579,9 +1386,8 @@ export default function SimpleCalendar() {
                             // When moving between columns, only show preview at destination
                             if (movingSession && dragStart.col !== dragEnd.col) {
                               // Show the full session duration at the destination column
-                              const sessionDuration = Math.abs((dragStart.hour * 60 + dragStart.minute) - (dragEnd.hour * 60 + dragEnd.minute));
                               const destStart = dragEnd.hour * 60 + dragEnd.minute;
-                              const destEnd = destStart + (movingSession.endMinute! - movingSession.startMinute! + (movingSession.endHour! - movingSession.startHour!) * 60);
+                              const destEnd = destStart + (movingSession.session.endMinute! - movingSession.session.startMinute! + (movingSession.session.endHour! - movingSession.session.startHour!) * 60);
                               const cellStart = hour * 60 + cellMinute;
                               const cellEnd = cellStart + 15;
                               return cellStart < destEnd && cellEnd > destStart;
