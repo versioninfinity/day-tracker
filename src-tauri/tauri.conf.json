@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "day-tracker-temp",
+  "productName": "Dropbox Calendar",
   "version": "0.1.0",
-  "identifier": "com.zaragoel.day-tracker-temp",
+  "identifier": "com.zaragoel.dropbox-calendar",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "day-tracker-temp",
+        "title": "Dropbox Calendar",
         "width": 800,
         "height": 600
       }
