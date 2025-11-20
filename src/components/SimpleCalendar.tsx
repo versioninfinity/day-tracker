@@ -1694,13 +1694,13 @@ export default function SimpleCalendar() {
               <div className="flex gap-2 mb-3">
                 <button
                   onClick={handleAddFiles}
-                  className="flex-1 px-3 py-2 text-sm bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors"
+                  className="flex-1 px-3 py-1.5 text-sm bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors"
                 >
                   Add Files
                 </button>
                 <button
                   onClick={handleAddFolder}
-                  className="flex-1 px-3 py-2 text-sm bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors"
+                  className="flex-1 px-3 py-1.5 text-sm bg-gray-500 text-white rounded-lg hover:bg-gray-600 transition-colors"
                   disabled={fileTrackingProgress?.isTracking}
                 >
                   Add Folder
