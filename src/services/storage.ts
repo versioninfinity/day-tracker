@@ -143,7 +143,8 @@ export class StorageService {
       'storage',
       'storage/files',
       'storage/diffs',
-      'git-repos'
+      'git-repos',
+      'backups'
     ];
 
     for (const dir of directories) {

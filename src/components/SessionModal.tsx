@@ -238,13 +238,13 @@ export default function SessionModal({
             <div className="flex gap-2 mb-2">
               <button
                 onClick={handleAddFiles}
-                className="px-4 py-2 bg-green-500 text-white rounded-md hover:bg-green-600"
+                className="px-3 py-1.5 text-sm bg-gray-500 text-white rounded-md hover:bg-gray-600"
               >
                 Add Files
               </button>
               <button
                 onClick={handleAddFolder}
-                className="px-4 py-2 bg-green-500 text-white rounded-md hover:bg-green-600"
+                className="px-3 py-1.5 text-sm bg-gray-500 text-white rounded-md hover:bg-gray-600"
               >
                 Add Folder
               </button>
