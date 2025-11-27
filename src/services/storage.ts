@@ -53,6 +53,48 @@ export interface FileContent {
   backup_file_path: string | null;
 }
 
+// Timeline Planning Types
+export interface TimelineProject {
+  id: string;
+  name: string;
+  description: string | null;
+  color: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TimelineMilestone {
+  id: string;
+  project_id: string;
+  title: string;
+  description: string | null;
+  date: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'blocked';
+  agent_task: string | null;
+  agent_delivery: string | null;
+  agent_todo: string | null;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TimelineChatMessage {
+  id: string;
+  project_id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  tool_calls: string | null;
+  created_at: string;
+}
+
+export interface TimelineChatSummary {
+  id: string;
+  project_id: string;
+  summary: string;
+  message_count: number;
+  created_at: string;
+}
+
 export class StorageService {
   private static instance: StorageService;
   private db: Database | null = null;
@@ -329,6 +371,76 @@ export class StorageService {
       `);
       console.log('  ✓ Indexes created for sessions');
 
+      // Timeline Planning: Create projects table
+      await this.db.execute(`
+        CREATE TABLE IF NOT EXISTS timeline_projects (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          description TEXT,
+          color TEXT DEFAULT '#3B82F6',
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      console.log('  ✓ Table created: timeline_projects');
+
+      // Timeline Planning: Create milestones table
+      await this.db.execute(`
+        CREATE TABLE IF NOT EXISTS timeline_milestones (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT,
+          date TEXT NOT NULL,
+          status TEXT DEFAULT 'pending',
+          agent_task TEXT,
+          agent_delivery TEXT,
+          agent_todo TEXT,
+          position INTEGER DEFAULT 0,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (project_id) REFERENCES timeline_projects(id) ON DELETE CASCADE
+        )
+      `);
+      console.log('  ✓ Table created: timeline_milestones');
+
+      // Create index for milestones by project
+      await this.db.execute(`
+        CREATE INDEX IF NOT EXISTS idx_milestones_project ON timeline_milestones(project_id)
+      `);
+
+      // Timeline Planning: Create chat history table
+      await this.db.execute(`
+        CREATE TABLE IF NOT EXISTS timeline_chat_history (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL,
+          tool_calls TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (project_id) REFERENCES timeline_projects(id) ON DELETE CASCADE
+        )
+      `);
+      console.log('  ✓ Table created: timeline_chat_history');
+
+      // Create index for chat history by project
+      await this.db.execute(`
+        CREATE INDEX IF NOT EXISTS idx_chat_history_project ON timeline_chat_history(project_id)
+      `);
+
+      // Timeline Planning: Create chat summaries table (for memory)
+      await this.db.execute(`
+        CREATE TABLE IF NOT EXISTS timeline_chat_summaries (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          message_count INTEGER DEFAULT 0,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (project_id) REFERENCES timeline_projects(id) ON DELETE CASCADE
+        )
+      `);
+      console.log('  ✓ Table created: timeline_chat_summaries');
+
       console.log('✅ Database initialized');
     } catch (error) {
       console.error('  ✗ Database initialization failed:', error);
@@ -488,17 +600,38 @@ export class StorageService {
           console.log(`  Destination: ${backupPath}`);
 
           if (fileType === 'folder') {
-            // Use rsync to copy entire folder (preserves structure and permissions)
+            // Use platform-specific copy command
             const { Command } = await import('@tauri-apps/plugin-shell');
-            const rsync = await Command.create('rsync', [
-              '-a',              // archive mode (recursive, preserves everything)
-              '--exclude', '.git',  // exclude .git folders
-              filePath + '/',    // source (trailing slash = contents)
-              backupPath + '/'   // destination
-            ]);
+            const { platform } = await import('@tauri-apps/plugin-os');
+            const os = platform();
 
-            console.log(`  📦 Copying folder with rsync...`);
-            const output = await rsync.execute();
+            let output;
+            console.log(`  📦 Copying folder (${os})...`);
+
+            if (os === 'windows') {
+              // Use robocopy on Windows (silent mode)
+              const robocopy = await Command.create('robocopy', [
+                filePath,
+                backupPath,
+                '/E',              // copy subdirectories including empty
+                '/XD', '.git',     // exclude .git folders
+                '/NFL', '/NDL', '/NJH', '/NJS', '/NC', '/NS', '/NP'  // silent
+              ]);
+              output = await robocopy.execute();
+              // robocopy returns 0-7 for success, 8+ for errors
+              if (output.code !== null && output.code <= 7) {
+                output.code = 0;
+              }
+            } else {
+              // Use rsync on macOS/Linux
+              const rsync = await Command.create('rsync', [
+                '-a',
+                '--exclude', '.git',
+                filePath + '/',
+                backupPath + '/'
+              ]);
+              output = await rsync.execute();
+            }
 
             if (output.code === 0) {
               console.log(`  ✅ Backup created successfully`);
@@ -518,48 +651,51 @@ export class StorageService {
                 }));
               }
             } else {
-              console.error(`  ❌ rsync failed with code ${output.code}`);
+              console.error(`  ❌ Copy failed with code ${output.code}`);
               console.error(output.stderr);
               backupName = null;
             }
           } else {
-            // For individual files, use cp command to copy
+            // For individual files, use platform-specific copy
             const { Command } = await import('@tauri-apps/plugin-shell');
+            const { platform } = await import('@tauri-apps/plugin-os');
+            const os = platform();
 
-            // Create backup directory for the file
-            const mkdirCmd = await Command.create('mkdir', ['-p', backupPath]);
-            await mkdirCmd.execute();
+            let output;
+            console.log(`  📄 Copying file (${os})...`);
 
-            // Copy the file to backup location
-            const cp = await Command.create('cp', [
-              '-p',              // preserve file attributes
-              filePath,          // source file
-              backupPath + '/'   // destination directory
-            ]);
-
-            console.log(`  📄 Copying file with cp...`);
-            const output = await cp.execute();
+            if (os === 'windows') {
+              // Use robocopy for single file on Windows
+              const fileDir = filePath.substring(0, filePath.lastIndexOf('\\') || filePath.lastIndexOf('/'));
+              const fileNameOnly = filePath.substring(Math.max(filePath.lastIndexOf('\\'), filePath.lastIndexOf('/')) + 1);
+              const robocopy = await Command.create('robocopy', [
+                fileDir,
+                backupPath,
+                fileNameOnly,
+                '/NFL', '/NDL', '/NJH', '/NJS', '/NC', '/NS', '/NP'
+              ]);
+              output = await robocopy.execute();
+              if (output.code !== null && output.code <= 7) {
+                output.code = 0;
+              }
+            } else {
+              // Use rsync on macOS/Linux
+              const rsync = await Command.create('rsync', [
+                '-a',
+                filePath,
+                backupPath + '/'
+              ]);
+              output = await rsync.execute();
+            }
 
             if (output.code === 0) {
               console.log(`  ✅ File backup created successfully`);
               isFullBackup = 1;
-
-              // Store file content record for individual file
-              const backupFilePath = `${backupPath}/${fileName}`;
-              fileContentsToInsert = [{
-                id: crypto.randomUUID(),
-                folder_metadata_id: id,
-                relative_path: fileName,
-                file_hash: fileHash,
-                file_size: fileSize,
-                modified_at: modifiedAt,
-                change_type: 'added',
-                backup_file_path: backupFilePath
-              }];
             } else {
-              console.error(`  ❌ cp failed with code ${output.code}`);
+              console.error(`  ❌ Copy failed with code ${output.code ?? 'null'}`);
               console.error(output.stderr);
               backupName = null;
+              isFullBackup = 0;
             }
           }
 
@@ -1022,6 +1158,327 @@ export class StorageService {
       this.db = null;
       this.initialized = false;
       console.log('✅ Storage closed');
+    }
+  }
+
+  // ==========================================
+  // Timeline Planning: Project Methods
+  // ==========================================
+
+  /**
+   * Create a new timeline project
+   */
+  public async createTimelineProject(name: string, description?: string, color?: string): Promise<TimelineProject> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    await this.db.execute(
+      `INSERT INTO timeline_projects (id, name, description, color, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, name, description || null, color || '#3B82F6', now, now]
+    );
+
+    return {
+      id,
+      name,
+      description: description || null,
+      color: color || '#3B82F6',
+      created_at: now,
+      updated_at: now
+    };
+  }
+
+  /**
+   * Get all timeline projects
+   */
+  public async getTimelineProjects(): Promise<TimelineProject[]> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const results = await this.db.select<TimelineProject[]>(
+      'SELECT * FROM timeline_projects ORDER BY created_at DESC'
+    );
+    return results;
+  }
+
+  /**
+   * Get a single timeline project by ID
+   */
+  public async getTimelineProject(projectId: string): Promise<TimelineProject | null> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const results = await this.db.select<TimelineProject[]>(
+      'SELECT * FROM timeline_projects WHERE id = ?',
+      [projectId]
+    );
+    return results.length > 0 ? results[0] : null;
+  }
+
+  /**
+   * Update a timeline project
+   */
+  public async updateTimelineProject(projectId: string, updates: Partial<Pick<TimelineProject, 'name' | 'description' | 'color'>>): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const now = new Date().toISOString();
+    const setClauses: string[] = ['updated_at = ?'];
+    const values: any[] = [now];
+
+    if (updates.name !== undefined) {
+      setClauses.push('name = ?');
+      values.push(updates.name);
+    }
+    if (updates.description !== undefined) {
+      setClauses.push('description = ?');
+      values.push(updates.description);
+    }
+    if (updates.color !== undefined) {
+      setClauses.push('color = ?');
+      values.push(updates.color);
+    }
+
+    values.push(projectId);
+    await this.db.execute(
+      `UPDATE timeline_projects SET ${setClauses.join(', ')} WHERE id = ?`,
+      values
+    );
+  }
+
+  /**
+   * Delete a timeline project (cascades to milestones and chat)
+   */
+  public async deleteTimelineProject(projectId: string): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    // Delete related data first (SQLite may not enforce FK cascade)
+    await this.db.execute('DELETE FROM timeline_chat_summaries WHERE project_id = ?', [projectId]);
+    await this.db.execute('DELETE FROM timeline_chat_history WHERE project_id = ?', [projectId]);
+    await this.db.execute('DELETE FROM timeline_milestones WHERE project_id = ?', [projectId]);
+    await this.db.execute('DELETE FROM timeline_projects WHERE id = ?', [projectId]);
+  }
+
+  // ==========================================
+  // Timeline Planning: Milestone Methods
+  // ==========================================
+
+  /**
+   * Create a new milestone
+   */
+  public async createTimelineMilestone(
+    projectId: string,
+    title: string,
+    date: string,
+    options?: {
+      description?: string;
+      status?: TimelineMilestone['status'];
+      agent_task?: string;
+      agent_delivery?: string;
+      agent_todo?: string;
+      position?: number;
+    }
+  ): Promise<TimelineMilestone> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    // Get max position for this project
+    const posResult = await this.db.select<{max_pos: number}[]>(
+      'SELECT COALESCE(MAX(position), -1) as max_pos FROM timeline_milestones WHERE project_id = ?',
+      [projectId]
+    );
+    const position = options?.position ?? (posResult[0]?.max_pos ?? -1) + 1;
+
+    await this.db.execute(
+      `INSERT INTO timeline_milestones
+       (id, project_id, title, description, date, status, agent_task, agent_delivery, agent_todo, position, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, projectId, title, options?.description || null, date,
+        options?.status || 'pending',
+        options?.agent_task || null,
+        options?.agent_delivery || null,
+        options?.agent_todo || null,
+        position, now, now
+      ]
+    );
+
+    return {
+      id,
+      project_id: projectId,
+      title,
+      description: options?.description || null,
+      date,
+      status: options?.status || 'pending',
+      agent_task: options?.agent_task || null,
+      agent_delivery: options?.agent_delivery || null,
+      agent_todo: options?.agent_todo || null,
+      position,
+      created_at: now,
+      updated_at: now
+    };
+  }
+
+  /**
+   * Get all milestones for a project
+   */
+  public async getTimelineMilestones(projectId: string): Promise<TimelineMilestone[]> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const results = await this.db.select<TimelineMilestone[]>(
+      'SELECT * FROM timeline_milestones WHERE project_id = ? ORDER BY date ASC, position ASC',
+      [projectId]
+    );
+    return results;
+  }
+
+  /**
+   * Update a milestone
+   */
+  public async updateTimelineMilestone(
+    milestoneId: string,
+    updates: Partial<Omit<TimelineMilestone, 'id' | 'project_id' | 'created_at' | 'updated_at'>>
+  ): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const now = new Date().toISOString();
+    const setClauses: string[] = ['updated_at = ?'];
+    const values: any[] = [now];
+
+    const fields: (keyof typeof updates)[] = ['title', 'description', 'date', 'status', 'agent_task', 'agent_delivery', 'agent_todo', 'position'];
+    for (const field of fields) {
+      if (updates[field] !== undefined) {
+        setClauses.push(`${field} = ?`);
+        values.push(updates[field]);
+      }
+    }
+
+    values.push(milestoneId);
+    await this.db.execute(
+      `UPDATE timeline_milestones SET ${setClauses.join(', ')} WHERE id = ?`,
+      values
+    );
+  }
+
+  /**
+   * Delete a milestone
+   */
+  public async deleteTimelineMilestone(milestoneId: string): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+    await this.db.execute('DELETE FROM timeline_milestones WHERE id = ?', [milestoneId]);
+  }
+
+  // ==========================================
+  // Timeline Planning: Chat Methods
+  // ==========================================
+
+  /**
+   * Add a chat message
+   */
+  public async addTimelineChatMessage(
+    projectId: string,
+    role: TimelineChatMessage['role'],
+    content: string,
+    toolCalls?: object
+  ): Promise<TimelineChatMessage> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const toolCallsJson = toolCalls ? JSON.stringify(toolCalls) : null;
+
+    await this.db.execute(
+      `INSERT INTO timeline_chat_history (id, project_id, role, content, tool_calls, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, projectId, role, content, toolCallsJson, now]
+    );
+
+    return {
+      id,
+      project_id: projectId,
+      role,
+      content,
+      tool_calls: toolCallsJson,
+      created_at: now
+    };
+  }
+
+  /**
+   * Get chat history for a project
+   */
+  public async getTimelineChatHistory(projectId: string, limit?: number): Promise<TimelineChatMessage[]> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const query = limit
+      ? 'SELECT * FROM timeline_chat_history WHERE project_id = ? ORDER BY created_at DESC LIMIT ?'
+      : 'SELECT * FROM timeline_chat_history WHERE project_id = ? ORDER BY created_at ASC';
+
+    const results = await this.db.select<TimelineChatMessage[]>(
+      query,
+      limit ? [projectId, limit] : [projectId]
+    );
+
+    // If we limited, reverse to get chronological order
+    return limit ? results.reverse() : results;
+  }
+
+  /**
+   * Add a chat summary (for memory compression)
+   */
+  public async addTimelineChatSummary(projectId: string, summary: string, messageCount: number): Promise<TimelineChatSummary> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    await this.db.execute(
+      `INSERT INTO timeline_chat_summaries (id, project_id, summary, message_count, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [id, projectId, summary, messageCount, now]
+    );
+
+    return {
+      id,
+      project_id: projectId,
+      summary,
+      message_count: messageCount,
+      created_at: now
+    };
+  }
+
+  /**
+   * Get chat summaries for a project
+   */
+  public async getTimelineChatSummaries(projectId: string): Promise<TimelineChatSummary[]> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const results = await this.db.select<TimelineChatSummary[]>(
+      'SELECT * FROM timeline_chat_summaries WHERE project_id = ? ORDER BY created_at ASC',
+      [projectId]
+    );
+    return results;
+  }
+
+  /**
+   * Clear old chat messages after summarization
+   */
+  public async clearOldTimelineChatMessages(projectId: string, keepLastN: number): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    // Get IDs of messages to keep
+    const toKeep = await this.db.select<{id: string}[]>(
+      'SELECT id FROM timeline_chat_history WHERE project_id = ? ORDER BY created_at DESC LIMIT ?',
+      [projectId, keepLastN]
+    );
+
+    if (toKeep.length > 0) {
+      const keepIds = toKeep.map(m => m.id);
+      const placeholders = keepIds.map(() => '?').join(',');
+      await this.db.execute(
+        `DELETE FROM timeline_chat_history WHERE project_id = ? AND id NOT IN (${placeholders})`,
+        [projectId, ...keepIds]
+      );
     }
   }
 }

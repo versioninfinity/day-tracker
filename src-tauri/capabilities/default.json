@@ -57,8 +57,15 @@
           "cmd": "git",
           "args": true,
           "sidecar": false
+        },
+        {
+          "name": "robocopy",
+          "cmd": "robocopy",
+          "args": true,
+          "sidecar": false
         }
       ]
-    }
+    },
+    "os:default"
   ]
 }

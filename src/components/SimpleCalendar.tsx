@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
-import { open, ask } from '@tauri-apps/plugin-dialog';
+import { open } from '@tauri-apps/plugin-dialog';
 import { stat } from '@tauri-apps/plugin-fs';
 import { openPath } from '@tauri-apps/plugin-opener';
 import { storageService } from '../services/storage';
+import TimelinePlanner from './TimelinePlanner';
 
 // Cloud sync configuration
 // TODO: Replace with your Vercel API URL after deployment
@@ -94,6 +95,7 @@ export default function SimpleCalendar() {
   const [weekOffset, setWeekOffset] = useState(0); // 0 = current week, -1 = previous week, +1 = next week
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isTimezoneConverting, setIsTimezoneConverting] = useState(false);
+  const [timelinePlannerExpanded, setTimelinePlannerExpanded] = useState(false);
   const [fileTrackingProgress, setFileTrackingProgress] = useState<{
     isTracking: boolean;
     current: number;
@@ -435,87 +437,12 @@ export default function SimpleCalendar() {
     }
   };
 
-  // Restore sessions from database to localStorage
-  const syncFromDatabase = async () => {
-    if (!storageService.isInitialized()) {
-      alert('Storage service not initialized');
-      return;
-    }
-
-    try {
-      const confirmed = await ask('Restore sessions from database? This will replace your current sessions in the calendar view.', {
-        title: 'Restore from Database',
-        kind: 'info',
-      });
-      if (!confirmed) return;
-
-      console.log('📥 Loading sessions from database...');
-      const dbSessions = await storageService.loadSessions();
-
-      // Convert database format to TimeSlot format (UTC -> selected timezone)
-      const restoredSlots: TimeSlot[] = await Promise.all(
-        dbSessions.map(async session => {
-          const utcStart = new Date(session.start_time);
-          const utcEnd = new Date(session.end_time);
-
-          // Convert UTC to selected timezone
-          const startTime = convertUTCToTimezone(utcStart);
-          const endTime = convertUTCToTimezone(utcEnd);
-
-          // Restore linked files for this session
-          const sessionFiles = await storageService.getSessionFiles(session.id);
-          const files = sessionFiles.map(fileMetadata => ({
-            id: fileMetadata.id,
-            name: fileMetadata.file_name,
-            path: fileMetadata.file_path,
-            size: fileMetadata.file_size || 0,
-            type: fileMetadata.file_type as 'file' | 'folder',
-            hash: fileMetadata.file_hash || undefined,
-            metadataId: fileMetadata.id,
-            tracked: true,
-            backupName: fileMetadata.backup_name || undefined,
-            isFullBackup: fileMetadata.is_full_backup === 1,
-          }));
-
-          return {
-            date: getLocalDateString(startTime),
-            day: startTime.getDay(),
-            hour: startTime.getHours(),
-            title: session.title,
-            labels: session.labels,
-            notes: session.notes,
-            startMinute: startTime.getMinutes(),
-            endMinute: endTime.getMinutes(),
-            startHour: startTime.getHours(),
-            endHour: endTime.getHours(),
-            column: session.column_index || 0,
-            sessionId: session.id,
-            files,
-          };
-        })
-      );
-
-      console.log('📦 Restored slots:', restoredSlots);
-      setSlots(restoredSlots);
-      console.log(`✅ Restored ${restoredSlots.length} sessions from database`);
-      alert(`Successfully restored ${restoredSlots.length} sessions from database!`);
-    } catch (error) {
-      console.error('❌ Database restore error:', error);
-      alert('Failed to restore sessions from database. Check console for details.');
-    }
-  };
-
   // Helper to get local date string (YYYY-MM-DD) without timezone conversion
   const getLocalDateString = (date: Date): string => {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
-  };
-
-  // Convert UTC date to selected timezone
-  const convertUTCToTimezone = (utcDate: Date): Date => {
-    return new Date(utcDate.toLocaleString('en-US', { timeZone: selectedTimezone }));
   };
 
   // Calculate dates for the week starting from Sunday
@@ -827,13 +754,18 @@ export default function SimpleCalendar() {
       const sessionDate = weekDates[editingSession.day];
       const dateString = getLocalDateString(sessionDate);
 
-      // Delete all file metadata for this session from database
+      // Delete session from database
       if (storageService.isInitialized()) {
         try {
+          // Delete all file metadata for this session
           await storageService.deleteSessionFiles(editingSession.sessionId);
           console.log(`✅ Deleted all files for session from database`);
+
+          // Delete the session itself from database
+          await storageService.deleteSession(editingSession.sessionId);
+          console.log(`✅ Deleted session ${editingSession.sessionId} from database`);
         } catch (error) {
-          console.error('⚠️  Failed to delete session files from database:', error);
+          console.error('⚠️  Failed to delete session from database:', error);
         }
       }
 
@@ -1245,6 +1177,12 @@ export default function SimpleCalendar() {
     <div className="flex h-screen bg-white">
       {/* Left side - Calendar */}
       <div className="flex-1 flex flex-col overflow-hidden">
+        {/* Timeline Planner - collapsible at top */}
+        <TimelinePlanner
+          isExpanded={timelinePlannerExpanded}
+          onToggle={() => setTimelinePlannerExpanded(!timelinePlannerExpanded)}
+        />
+
         {/* Header with month/year and navigation */}
         <div className="px-6 py-4 bg-white" style={{ borderBottom: '1px solid #F3F4F6' }}>
           <div className="flex justify-between items-center">
@@ -1267,14 +1205,6 @@ export default function SimpleCalendar() {
                   </option>
                 ))}
               </select>
-
-              <button
-                onClick={syncFromDatabase}
-                className="ml-2 px-3 py-1 text-xs text-blue-600 hover:bg-blue-50 rounded-lg border border-blue-300"
-                title="Restore sessions from database backup"
-              >
-                💾 Sync from DB
-              </button>
             </div>
           </div>
         </div>
@@ -1743,8 +1673,8 @@ export default function SimpleCalendar() {
                         <div className="flex items-center gap-2">
                           <div className="font-medium truncate text-gray-800 hover:text-blue-600">{file.name}</div>
                           {file.backupName && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-700 rounded" title={`Backed up: ${file.backupName}`}>
-                              ✓ Backed up
+                            <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-700 rounded whitespace-nowrap" title={`Backed up: ${file.backupName}`}>
+                              ✓
                             </span>
                           )}
                           {file.tracked && !file.backupName && (
@@ -1764,7 +1694,7 @@ export default function SimpleCalendar() {
                       <div className="flex items-center gap-2 ml-2">
                         <button
                           onClick={() => handleOpenFile(file.path)}
-                          className="px-2 py-1 text-[10px] bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                          className="px-2 py-1 text-[10px] bg-amber-700 text-white rounded hover:bg-amber-800 transition-colors"
                           title="Open file/folder"
                         >
                           Open
@@ -1772,7 +1702,7 @@ export default function SimpleCalendar() {
                         {file.backupName && (
                           <button
                             onClick={() => handleOpenBackup(file.backupName!)}
-                            className="px-2 py-1 text-[10px] bg-purple-500 text-white rounded hover:bg-purple-600 transition-colors"
+                            className="px-2 py-1 text-[10px] bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors"
                             title={`Open backup: ${file.backupName} (${file.isFullBackup ? 'Full' : 'Differential'})`}
                           >
                             📸 Backup
